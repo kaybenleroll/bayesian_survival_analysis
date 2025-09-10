@@ -1,0 +1,151 @@
+---
+title: "Initial Exploration of the P/NBD Model"
+author: "Mick Cooney <mickcooney@gmail.com>"
+date: "Last updated: `r format(Sys.time(), '%B %d, %Y')`"
+editor: source
+execute:
+  message: false
+  warning: false
+  error: false
+format:
+  html:
+    light: superhero
+    dark: darkly
+    anchor-sections: true
+    embed-resources: true
+    number-sections: true
+    smooth-scroll: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+---
+
+
+```{r import_libraries}
+#| echo: FALSE
+#| message: FALSE
+
+library(conflicted)
+library(tidyverse)
+library(scales)
+library(cowplot)
+library(magrittr)
+library(rlang)
+library(arrow)
+library(fs)
+library(purrr)
+library(furrr)
+library(glue)
+library(cmdstanr)
+library(brms)
+library(posterior)
+library(bayesplot)
+library(tidybayes)
+library(splines2)
+
+
+source("lib_utils.R")
+
+
+conflict_lst <- resolve_conflicts(
+  c("magrittr", "rlang", "dplyr", "readr", "purrr", "ggplot2", "MASS",
+    "fitdistrplus")
+  )
+
+
+options(
+  width = 80L,
+  warn  = 1,
+  mc.cores = parallelly::availableCores()
+  )
+
+
+set.seed(42)
+stanfit_seed <- 4000
+
+theme_set(theme_cowplot())
+
+plan(multisession)
+```
+
+
+# Load Policy Data
+
+We first need to load the policy data so we might visualise some of this data.
+
+```{r load_policy_data}
+#| echo: TRUE
+
+policy_data_raw_tbl <- read_parquet("data/lifeins_policybook_inoutforce.parquet")
+
+policy_data_raw_tbl |> glimpse()
+```
+
+We now want to determine the observed lifetime of the policy, which depends
+on the status of the policy.
+
+
+```{r determine_policy_lifetime}
+#| echo: FALSE
+
+policy_protection_data_tbl <- policy_data_raw_tbl |>
+  filter(prod_type == "protection") |>
+  mutate(
+    weeks_to_now    = difftime(as.Date("2016-01-01"),   policy_startdate, units = "weeks") |> as.numeric(),
+    weeks_to_status = difftime(policy_statuschangedate, policy_startdate, units = "weeks") |> as.numeric(),
+    
+    policy_lifetime = if_else(policy_status == "inforce", weeks_to_now, weeks_to_status)
+    )
+
+policy_protection_data_tbl |> glimpse()
+```
+
+
+We want to fit a more cutdown version of this model, so we sample 1,000 data
+points to help us assess our models.
+
+```{r sample_initial_modelling_data}
+#| echo: TRUE
+
+model_data_tbl <- policy_protection_data_tbl |>
+  slice_sample(n = 10000)
+
+model_data_tbl |> glimpse()
+```
+
+
+
+# Build Initial Cox Model
+
+```{r build_initial_cox_model}
+#| echo: FALSE
+
+stan_modeldir <- "stan_models"
+stan_codedir  <-   "stan_code"
+
+
+bfit <- brm(
+  policy_lifetime | cens(1-lapsed) ~ gender_life1 + smoker_life1 + isjointlife + islifeonly + mortgage_status,
+  data        = model_data_tbl,
+  family      = cox(),
+  cores       = 4,
+  seed        = 421,
+  save_warmup = FALSE,
+  backend     = "cmdstanr",
+  save_model  = "stan_code/brm_cox.stan",
+
+  stan_model_args = list(
+    include_paths   =     "stan_code",
+    pedantic        =            TRUE,
+    dir             =    "stan_model"
+    )
+  )
+
+summary(bfit)
+
+```
+
+
+

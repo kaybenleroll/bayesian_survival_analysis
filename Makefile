@@ -71,8 +71,8 @@ clean-models:
 ### Docker targets
 docker-build-image: Dockerfile
 	docker build -t ${IMAGE_TAG} \
-	  ${DOCKER_BUILD_ARGS} \
 	  --build-arg BUILD_DATE=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ') \
+	  ${DOCKER_BUILD_ARGS} \
 	  -f Dockerfile . 2>&1 | tee -a docker_build.log
 
 docker-show-context:

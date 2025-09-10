@@ -64,28 +64,35 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     fitdistrplus \
     fs \
     furrr \
+    Hmisc \
     lifecontingencies \
     loo \
     markdown \
     modeltime \
+    nanoparquet \
     posterior \
     projpred \
     prophet \
     pryr \
     quarto \
+    regplot \
     rstan \
     rstanarm \
     sessioninfo \
     shinybrms \
     shinystan \
     snakecase \
+    splines2 \
     survival \
+    survivalAnalysis \
+    survivalmodels \
     survminer \
     survMisc \
-    survregplot \
     survstan \
     tictoc \
     tidybayes \
+    tidygraph \
+    tidymodels \
     tidyquant \
     timetk
 
