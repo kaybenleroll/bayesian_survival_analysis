@@ -15,18 +15,22 @@ library(lubridate)
 #'   - policy_enddate (Date): Policy end date
 #'   - policy_status (character): Current policy status
 #'   - policy_statuschangedate (Date): Date when status changed
+#'   - dob_life1 (Date): Date of birth of primary policyholder
 #' @param reference_date A Date object representing the date at which to check status
 #'
-#' @return A tibble with an additional column 'status_at_reference_date' indicating:
-#'   - 'not_started': Policy hasn't started yet
-#'   - 'active': Policy is active and in force
-#'   - 'expired': Policy term has ended
-#'   - 'lapsed': Policy has lapsed before the reference date
+#' @return A tibble with additional columns:
+#'   - status_at_reference_date: 'not_started', 'inforce', 'completed', 'lapsed', or 'unknown'
+#'   - weeks_to_refdate: Weeks from policy start to reference date
+#'   - weeks_to_statusdate: Weeks from policy start to status change date
+#'   - policy_lifetime: Weeks of policy life (to reference date if inforce, to status date if lapsed)
+#'   - age_at_refdate: Age of policyholder at reference date (in years)
+#'   - age_at_statusdate: Age of policyholder at status change date (in years)
+#'   - age_at_observation: Age at appropriate date based on policy status
 #'
-determine_policy_status <- function(policy_data, reference_date) {
+determine_policy_status <- function(policy_data_tbl, reference_date) {
 
   # Validate inputs
-  if (!is.data.frame(policy_data)) {
+  if (!is.data.frame(policy_data_tbl)) {
     stop("policy_data must be a data frame or tibble")
     }
 
@@ -34,24 +38,32 @@ determine_policy_status <- function(policy_data, reference_date) {
     stop("reference_date must be a Date object")
     }
 
-  required_cols <- c("policy_startdate", "policy_enddate", "policy_status", "policy_statuschangedate")
-  missing_cols <- setdiff(required_cols, names(policy_data))
+  required_cols <- c(
+    "policy_startdate",
+    "policy_enddate",
+    "policy_status",
+    "policy_statuschangedate",
+    "dob_life1"
+    )
+
+  missing_cols <- setdiff(required_cols, names(policy_data_tbl))
 
   if (length(missing_cols) > 0) {
     stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
     }
 
   # Ensure date columns are Date objects
-  policy_data <- policy_data |>
+  policy_data_tbl <- policy_data_tbl |>
     mutate(
       across(
-        c(policy_startdate, policy_enddate, policy_statuschangedate),
+        c(policy_startdate, policy_enddate, policy_statuschangedate, dob_life1),
         as.Date
         )
       )
 
   # Determine status at reference date
-  updated_tbl <- policy_data |>
+  updated_tbl <- policy_data_tbl |>
+    filter(policy_startdate < reference_date) |>
     mutate(
       status_at_reference_date = case_when(
         # Policy hasn't started yet
@@ -75,16 +87,35 @@ determine_policy_status <- function(policy_data, reference_date) {
         ),
 
         weeks_to_refdate    = difftime(
-          reference_date,          policy_startdate, units = "weeks"
+          reference_date,          policy_startdate, units = "months"
           ) |> as.numeric(),
         weeks_to_statusdate = difftime(
-          policy_statuschangedate, policy_startdate, units = "weeks"
+          policy_statuschangedate, policy_startdate, units = "months"
           ) |> as.numeric(),
 
         policy_lifetime = if_else(
           policy_status == "inforce",
           weeks_to_refdate,
           weeks_to_statusdate
+          ),
+
+        # Calculate age at reference date
+        age_at_refdate = time_length(
+          difftime(reference_date, dob_life1),
+          unit = "years"
+          ),
+
+        # Calculate age at status change date (for lapsed policies)
+        age_at_statusdate = time_length(
+          difftime(policy_statuschangedate, dob_life1),
+          unit = "years"
+          ),
+
+        # Use appropriate age based on policy status
+        age_at_observation = if_else(
+          policy_status == "inforce",
+          age_at_refdate,
+          age_at_statusdate
           )
       )
 

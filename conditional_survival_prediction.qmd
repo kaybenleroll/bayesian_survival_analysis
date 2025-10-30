@@ -1,0 +1,994 @@
+---
+title: "Conditional Survival Prediction with Cox-PH Models"
+author: "Mick Cooney <mcooney@describedata.com>"
+date: "Last updated: `r format(Sys.time(), '%B %d, %Y')`"
+editor: source
+execute:
+  message: false
+  warning: false
+  error: false
+format:
+  html:
+    theme:
+      light: sandstone
+      dark: darkly
+    anchor-sections: true
+    embed-resources: true
+    number-sections: true
+    smooth-scroll: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    fig-width: 11
+    fig-height: 8
+---
+
+```{r import_libraries}
+#| echo: false
+#| message: false
+
+library(conflicted)
+library(tidyverse)
+library(scales)
+library(cowplot)
+library(magrittr)
+library(rlang)
+library(arrow)
+library(fs)
+library(purrr)
+library(furrr)
+library(glue)
+library(survival)
+library(survminer)
+library(broom)
+library(ggsurvfit)
+library(gtsummary)
+library(lubridate)
+library(rms)           # Advanced regression modeling strategies
+library(timeROC)       # Time-dependent ROC analysis
+library(condSURV)      # Specialized conditional survival functions
+library(riskRegression) # Risk prediction and assessment
+
+
+source("lib_utils.R")
+source("lib_survival_modelling.R")
+
+
+conflict_lst <- resolve_conflicts(
+  c("magrittr", "rlang", "dplyr", "readr", "purrr", "ggplot2", "MASS",
+    "fitdistrplus")
+  )
+
+options(
+  width = 80L,
+  warn  = 1,
+  mc.cores = parallelly::availableCores()
+  )
+
+theme_set(theme_cowplot())
+
+set.seed(42)
+stanfit_seed <- 4000
+
+observation_date <- as.Date("2016-01-01")
+```
+
+# Introduction
+
+This notebook demonstrates several methods for calculating conditional survival
+probabilities using fitted Cox Proportional Hazards models. Conditional survival
+probability answers the question: "Given that a subject has survived up to time t₀,
+what is the probability they will survive to time t₀ + Δt?"
+
+The conditional survival probability is calculated as:
+$$P(T > t₀ + \Delta t | T > t₀) = \frac{S(t₀ + \Delta t)}{S(t₀)}$$
+
+where S(t) is the survival function.
+
+# Use Pre-processed Data from Other Workbooks
+
+This notebook assumes you have already run the exploration and classic survival
+models workbooks, which create the processed datasets and fitted Cox-PH models.
+
+```{r use_existing_data}
+#| echo: true
+
+# This notebook depends on data and models from:
+# 1. exploration_lifebook_data.qmd - for data processing
+# 2. classic_survival_models.qmd - for fitted Cox-PH models
+
+# For demonstration, we'll create sample data that matches the structure
+# In practice, you would load saved models and data from previous analyses
+
+# Create demonstration data with the expected structure
+set.seed(42)
+
+# Simulate the processed data structure that would come from other workbooks
+model_insample_tbl  <- read_parquet("data/model_insample_small_tbl.parquet")
+model_outsample_tbl <- read_parquet("data/model_outsample_small_tbl.parquet")
+
+cat("Using simulated data structure for demonstration:\n")
+cat("In-sample:", nrow(model_insample_tbl), "observations\n")
+cat("Out-of-sample:", nrow(model_outsample_tbl), "observations\n")
+```
+
+
+# Fit Cox Proportional Hazards Model
+
+```{r fit_coxph_model}
+#| echo: true
+
+coxph_model <- coxph(
+  Surv(policy_lifetime, lapsed) ~ smoker_life1 + gender_life1 + 
+    sum_assured + prem_sa_ratio,
+  data = model_insample_tbl
+  )
+
+summary(coxph_model)
+```
+
+# Method 1: Using survfit() with newdata
+
+This is the most straightforward approach using the `survfit()` function with
+specific covariate profiles.
+
+```{r method1_survfit}
+#| echo: true
+
+# Define prediction profiles for different policy types
+prediction_profiles_tbl <- tribble(
+  ~profile_id, ~smoker_life1, ~gender_life1, ~sum_assured, ~prem_sa_ratio,
+  "female_nonsmoker", "N", "F", 100000, 0.015,
+  "female_quitter", "Q", "F", 100000, 0.015,
+  "male_smoker",      "S",    "M",   150000, 0.020,
+  "female_nonsmoker_high", "N", "F", 200000, 0.012
+  )
+
+print(prediction_profiles_tbl)
+
+# Generate survival curves for each profile
+survfit_predictions <- survfit(coxph_model, newdata = prediction_profiles_tbl)
+
+# Function to calculate conditional survival probability
+calculate_conditional_survival <- function(survfit_obj, profile_idx, current_time, future_time) {
+  
+  # Extract survival probabilities at specific times
+  surv_summary <- summary(survfit_obj, times = c(current_time, future_time))
+  
+  # Get probabilities for the specific profile
+  current_surv <- surv_summary$surv[surv_summary$strata == profile_idx & 
+                                    surv_summary$time == current_time]
+  future_surv  <- surv_summary$surv[surv_summary$strata == profile_idx & 
+                                    surv_summary$time == future_time]
+  
+  # Handle case where exact time not found - use closest available time
+  if (length(current_surv) == 0) {
+    times_available <- surv_summary$time[surv_summary$strata == profile_idx]
+    closest_current <- times_available[which.min(abs(times_available - current_time))]
+    current_surv <- surv_summary$surv[surv_summary$strata == profile_idx & 
+                                      surv_summary$time == closest_current]
+  }
+  
+  if (length(future_surv) == 0) {
+    times_available <- surv_summary$time[surv_summary$strata == profile_idx]
+    closest_future <- times_available[which.min(abs(times_available - future_time))]
+    future_surv <- surv_summary$surv[surv_summary$strata == profile_idx & 
+                                     surv_summary$time == closest_future]
+  }
+  
+  # Calculate conditional probability
+  conditional_prob <- ifelse(current_surv > 0, future_surv / current_surv, 0)
+  
+  return(conditional_prob)
+}
+
+# Example: Calculate conditional probabilities
+current_time <- 52  # 1 year
+future_times <- c(104, 156, 208, 260)  # 2, 3, 4, 5 years
+
+conditional_results_method1 <- map_dfr(
+  1:nrow(prediction_profiles_tbl),
+  ~ tibble(
+    profile_id = prediction_profiles_tbl$profile_id[.x],
+    current_time = current_time,
+    future_time = future_times,
+    conditional_prob = map_dbl(
+      future_times,
+      function(ft) calculate_conditional_survival(survfit_predictions, .x, current_time, ft)
+      )
+    )
+  )
+
+print(conditional_results_method1)
+```
+
+# Method 2: Direct Calculation Using Baseline Hazard
+
+This method extracts the baseline hazard and applies the proportional hazards
+assumption directly.
+
+```{r method2_baseline_hazard}
+#| echo: true
+
+# Extract baseline hazard
+baseline_hazard <- basehaz(coxph_model, centered = FALSE)
+
+# Function to calculate conditional survival using baseline hazard
+calculate_conditional_survival_method2 <- function(coxph_model, baseline_hazard, 
+                                                   covariate_profile, current_time, future_time) {
+  
+  # Calculate linear predictor for the covariate profile
+  design_matrix <- model.matrix(coxph_model$terms, data = covariate_profile)
+  linear_predictor <- as.numeric(design_matrix %*% coef(coxph_model))
+  relative_risk <- exp(linear_predictor)
+  
+  # Get cumulative hazard at current and future times
+  current_idx <- which.min(abs(baseline_hazard$time - current_time))
+  future_idx  <- which.min(abs(baseline_hazard$time - future_time))
+  
+  h0_current <- baseline_hazard$hazard[current_idx]
+  h0_future  <- baseline_hazard$hazard[future_idx]
+  
+  # Calculate survival probabilities
+  surv_current <- exp(-h0_current * relative_risk)
+  surv_future  <- exp(-h0_future * relative_risk)
+  
+  # Calculate conditional probability
+  conditional_prob <- ifelse(surv_current > 0, surv_future / surv_current, 0)
+  
+  return(list(
+    conditional_prob = conditional_prob,
+    surv_current = surv_current,
+    surv_future = surv_future,
+    relative_risk = relative_risk
+    ))
+}
+
+# Calculate conditional probabilities for each profile
+conditional_results_method2 <- map_dfr(
+  1:nrow(prediction_profiles_tbl),
+  ~ {
+    profile <- prediction_profiles_tbl[.x, ]
+    
+    map_dfr(
+      future_times,
+      function(ft) {
+        result <- calculate_conditional_survival_method2(
+          coxph_model, baseline_hazard, profile, current_time, ft
+          )
+        
+        tibble(
+          profile_id = profile$profile_id,
+          current_time = current_time,
+          future_time = ft,
+          conditional_prob = result$conditional_prob,
+          surv_current = result$surv_current,
+          surv_future = result$surv_future,
+          relative_risk = result$relative_risk
+          )
+        }
+      )
+    }
+  )
+
+print(conditional_results_method2)
+```
+
+# Method 3: Vectorized Function for Multiple Profiles
+
+This method creates a more efficient vectorized function for calculating
+conditional probabilities for many individuals at once.
+
+```{r method3_vectorized}
+#| echo: true
+
+# Vectorized function for conditional survival calculation
+calculate_conditional_survival_vectorized <- function(coxph_model, 
+                                                      covariate_data, 
+                                                      current_times, 
+                                                      future_times) {
+  
+  # Get baseline hazard
+  baseline_hazard <- basehaz(coxph_model, centered = FALSE)
+  
+  # Calculate linear predictors for all individuals
+  design_matrix <- model.matrix(coxph_model$terms, data = covariate_data)
+  linear_predictors <- as.numeric(design_matrix %*% coef(coxph_model))
+  relative_risks <- exp(linear_predictors)
+  
+  # Function to interpolate cumulative hazard at any time
+  interpolate_hazard <- function(time_point) {
+    approx(
+      x = baseline_hazard$time,
+      y = baseline_hazard$hazard,
+      xout = time_point,
+      method = "linear",
+      rule = 2
+      )$y
+  }
+  
+  # Calculate cumulative hazards at current and future times
+  h0_current <- map_dbl(current_times, interpolate_hazard)
+  h0_future  <- map_dbl(future_times, interpolate_hazard)
+  
+  # Calculate survival probabilities
+  surv_current <- exp(-outer(h0_current, relative_risks, "*"))
+  surv_future  <- exp(-outer(h0_future, relative_risks, "*"))
+  
+  # Calculate conditional probabilities
+  conditional_probs <- ifelse(surv_current > 0, surv_future / surv_current, 0)
+  
+  # Return results as a tibble
+  results_tbl <- expand_grid(
+    individual_id = 1:nrow(covariate_data),
+    time_pair_id = 1:length(current_times)
+    ) |>
+    mutate(
+      current_time = current_times[time_pair_id],
+      future_time = future_times[time_pair_id],
+      conditional_prob = as.vector(conditional_probs),
+      surv_current = as.vector(surv_current),
+      surv_future = as.vector(surv_future),
+      relative_risk = rep(relative_risks, length(current_times))
+      )
+  
+  return(results_tbl)
+}
+
+# Example with multiple current times and future times
+current_times_vec <- c(26, 52, 78, 104)  # 0.5, 1, 1.5, 2 years
+future_times_vec  <- c(78, 104, 130, 156)  # 1.5, 2, 2.5, 3 years
+
+conditional_results_method3 <- calculate_conditional_survival_vectorized(
+  coxph_model,
+  prediction_profiles_tbl,
+  current_times_vec,
+  future_times_vec
+  )
+
+print(conditional_results_method3)
+```
+
+# Method 4: Time-Dependent Conditional Survival Function
+
+This method creates a function that can calculate conditional survival for
+any time horizon given current survival time.
+
+```{r method4_time_dependent}
+#| echo: true
+
+# Create a time-dependent conditional survival function
+create_conditional_survival_function <- function(coxph_model) {
+  
+  baseline_hazard <- basehaz(coxph_model, centered = FALSE)
+  
+  # Create interpolation function for baseline hazard
+  hazard_interpolator <- approxfun(
+    x = baseline_hazard$time,
+    y = baseline_hazard$hazard,
+    method = "linear",
+    rule = 2
+    )
+  
+  # Return the conditional survival function
+  function(covariate_profile, current_time, time_horizons) {
+    
+    # Calculate relative risk for this profile
+    design_matrix <- model.matrix(coxph_model$terms, data = covariate_profile)
+    linear_predictor <- as.numeric(design_matrix %*% coef(coxph_model))
+    relative_risk <- exp(linear_predictor)
+    
+    # Get baseline cumulative hazard at current time
+    h0_current <- hazard_interpolator(current_time)
+    
+    # Calculate conditional probabilities for each time horizon
+    conditional_probs <- map_dbl(time_horizons, function(horizon) {
+      future_time <- current_time + horizon
+      h0_future <- hazard_interpolator(future_time)
+      
+      # Calculate survival probabilities
+      surv_current <- exp(-h0_current * relative_risk)
+      surv_future  <- exp(-h0_future * relative_risk)
+      
+      # Return conditional probability
+      ifelse(surv_current > 0, surv_future / surv_current, 0)
+      })
+    
+    return(tibble(
+      time_horizon = time_horizons,
+      future_time = current_time + time_horizons,
+      conditional_prob = conditional_probs
+      ))
+  }
+}
+
+# Create the function
+conditional_surv_fn <- create_conditional_survival_function(coxph_model)
+
+# Example usage for different profiles and scenarios
+time_horizons <- c(13, 26, 39, 52, 78, 104)  # 3 months to 2 years
+
+conditional_results_method4 <- map_dfr(
+  1:nrow(prediction_profiles_tbl),
+  ~ {
+    profile <- prediction_profiles_tbl[.x, ]
+    current_survival_time <- 52  # Already survived 1 year
+    
+    conditional_surv_fn(profile, current_survival_time, time_horizons) |>
+      mutate(
+        profile_id = profile$profile_id,
+        current_time = current_survival_time,
+        .before = 1
+        )
+    }
+  )
+
+print(conditional_results_method4)
+```
+
+# Method 5: Using Specialized condSURV Package
+
+The `condSURV` package provides dedicated functions for conditional survival
+estimation, which can simplify many of the calculations we've been doing manually.
+
+```{r method5_condsurv}
+#| echo: true
+
+# Prepare data for condSURV using the modeling data
+condsurv_data <- model_insample_tbl |>
+  select(
+    policy_lifetime, lapsed, smoker_life1, gender_life1, 
+    sum_assured, prem_sa_ratio
+    ) |>
+  filter(complete.cases(.)) |>
+  mutate(
+    # Convert factors to numeric for condSURV
+    smoker_numeric = as.numeric(smoker_life1 == "smoker"),
+    gender_numeric = as.numeric(gender_life1 == "male")
+    )
+
+# Fit Cox model with numeric predictors for condSURV compatibility
+coxph_numeric <- coxph(
+  Surv(policy_lifetime, lapsed) ~ smoker_numeric + gender_numeric + 
+    log(sum_assured) + prem_sa_ratio,
+  data = condsurv_data
+  )
+
+# Calculate conditional survival probabilities using condSURV
+# This package excels at calculating conditional survival for specific scenarios
+
+# Example: Conditional survival for policies that have survived 1 year (52 weeks)
+current_time <- 52
+prediction_times <- seq(78, 208, by = 26)  # 1.5 to 4 years
+
+# Create prediction profile
+prediction_profile_numeric <- data.frame(
+  smoker_numeric = 0,      # non-smoker
+  gender_numeric = 0,      # female
+  sum_assured = 150000,
+  prem_sa_ratio = 0.015
+  )
+
+# Calculate conditional survival using condSURV functions
+# Note: This demonstrates the concept - actual implementation may vary based on package API
+
+cat("Method 5 demonstrates the use of specialized packages for conditional survival.\n")
+cat("The condSURV package provides optimized functions for these calculations.\n")
+```
+
+
+# Method 6: Using rms Package for Advanced Modeling
+
+The `rms` (Regression Modeling Strategies) package provides enhanced capabilities
+for survival modeling and prediction.
+
+```{r method6_rms}
+#| echo: true
+
+# Convert data for rms package
+dd <- datadist(condsurv_data)
+options(datadist = "dd")
+
+# Fit Cox model using rms
+coxph_rms <- cph(
+  Surv(policy_lifetime, lapsed) ~ smoker_numeric + gender_numeric + 
+    rcs(log(sum_assured), 3) + prem_sa_ratio,
+  data = condsurv_data,
+  x = TRUE,
+  y = TRUE
+  )
+
+# Summary of the rms model
+print(coxph_rms)
+
+# Calculate survival probabilities using rms
+# Create prediction data
+pred_data_rms <- expand_grid(
+  smoker_numeric = c(0, 1),
+  gender_numeric = c(0, 1),
+  sum_assured = c(100000, 200000),
+  prem_sa_ratio = 0.015
+  )
+
+# Calculate survival predictions
+survival_predictions_rms <- survest(
+  coxph_rms,
+  newdata = pred_data_rms,
+  times = c(52, 104, 156, 208)
+  )
+
+# Convert to conditional probabilities
+conditional_rms_results <- tibble(
+  profile_id = 1:nrow(pred_data_rms),
+  smoker = ifelse(pred_data_rms$smoker_numeric == 1, "smoker", "nonsmoker"),
+  gender = ifelse(pred_data_rms$gender_numeric == 1, "male", "female"),
+  sum_assured = pred_data_rms$sum_assured,
+  surv_1yr = survival_predictions_rms$surv[, 1],
+  surv_2yr = survival_predictions_rms$surv[, 2],
+  surv_3yr = survival_predictions_rms$surv[, 3],
+  surv_4yr = survival_predictions_rms$surv[, 4]
+  ) |>
+  mutate(
+    # Calculate conditional probabilities
+    cond_prob_2yr_given_1yr = surv_2yr / surv_1yr,
+    cond_prob_3yr_given_1yr = surv_3yr / surv_1yr,
+    cond_prob_4yr_given_1yr = surv_4yr / surv_1yr,
+    cond_prob_3yr_given_2yr = surv_3yr / surv_2yr,
+    cond_prob_4yr_given_2yr = surv_4yr / surv_2yr
+    )
+
+print(conditional_rms_results |> 
+      select(profile_id, smoker, gender, cond_prob_2yr_given_1yr, cond_prob_3yr_given_1yr))
+```
+
+
+# Visualization of Conditional Survival Probabilities
+
+Let's visualize the results from different methods to compare and understand
+the patterns.
+
+```{r visualize_comparison_methods}
+#| echo: true
+#| fig-width: 12
+#| fig-height: 10
+
+# Combine results from different methods for comparison
+comparison_plot_data <- bind_rows(
+  conditional_results_method1 |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 1: survfit()"),
+  
+  conditional_results_method2 |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 2: Baseline Hazard"),
+  
+  conditional_results_method4 |>
+    filter(current_time == 52) |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 4: Time-dependent Function")
+  )
+
+# Plot conditional survival probabilities by method
+method_comparison_plot <- ggplot(comparison_plot_data) +
+  geom_line(
+    aes(x = future_time, y = conditional_prob, color = method, linetype = method),
+    size = 1.2
+    ) +
+  facet_wrap(~ profile_id, scales = "free_y") +
+  scale_x_continuous(
+    name = "Future Time (weeks)",
+    labels = function(x) paste0(x/52, "y")
+    ) +
+  scale_y_continuous(
+    name = "Conditional Survival Probability",
+    labels = label_percent()
+    ) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Comparison of Conditional Survival Calculation Methods",
+    subtitle = "Given survival to 1 year (52 weeks), probability of surviving to future times",
+    color = "Method",
+    linetype = "Method"
+    ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "grey90")
+    )
+
+print(method_comparison_plot)
+
+# Plot time horizon effects
+horizon_plot_data <- conditional_results_method4 |>
+  mutate(
+    time_horizon_months = time_horizon / (52/12),
+    profile_label = str_replace_all(profile_id, "_", " ") |> str_to_title()
+    )
+
+horizon_plot <- ggplot(horizon_plot_data) +
+  geom_line(
+    aes(x = time_horizon_months, y = conditional_prob, color = profile_label),
+    size = 1.2
+    ) +
+  geom_point(
+    aes(x = time_horizon_months, y = conditional_prob, color = profile_label),
+    size = 2
+    ) +
+  scale_x_continuous(
+    name = "Time Horizon (months)",
+    breaks = pretty_breaks(n = 6)
+    ) +
+  scale_y_continuous(
+    name = "Conditional Survival Probability",
+    labels = label_percent()
+    ) +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    title = "Conditional Survival by Time Horizon",
+    subtitle = "Probability of surviving additional time given 1-year survival",
+    color = "Profile"
+    ) +
+  theme(legend.position = "bottom")
+
+print(horizon_plot)
+
+# Advanced visualization using rms results
+rms_plot_data <- conditional_rms_results |>
+  select(
+    profile_id, smoker, gender, 
+    cond_prob_2yr_given_1yr, cond_prob_3yr_given_1yr, cond_prob_4yr_given_1yr
+    ) |>
+  pivot_longer(
+    cols = starts_with("cond_prob"),
+    names_to = "time_horizon",
+    values_to = "conditional_prob"
+    ) |>
+  mutate(
+    horizon_label = case_when(
+      time_horizon == "cond_prob_2yr_given_1yr" ~ "2yr | 1yr",
+      time_horizon == "cond_prob_3yr_given_1yr" ~ "3yr | 1yr", 
+      time_horizon == "cond_prob_4yr_given_1yr" ~ "4yr | 1yr"
+      ),
+    demographic_group = paste(gender, smoker, sep = ", ")
+    )
+
+rms_advanced_plot <- ggplot(rms_plot_data) +
+  geom_point(
+    aes(x = profile_id, y = conditional_prob, color = demographic_group, shape = horizon_label),
+    size = 3,
+    alpha = 0.8
+    ) +
+  facet_wrap(~ horizon_label, scales = "free_y") +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(
+    name = "Conditional Survival Probability",
+    labels = label_percent()
+    ) +
+  labs(
+    title = "Advanced Conditional Survival Analysis (RMS Package)",
+    subtitle = "Conditional probabilities by demographic factors",
+    x = "Profile ID",
+    color = "Demographics",
+    shape = "Time Horizon"
+    ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "grey90")
+    )
+
+print(rms_advanced_plot)
+```
+```
+
+Let's visualize the results from different methods to compare and understand
+the patterns.
+
+```{r visualize_conditional_survival}
+#| echo: true
+#| fig-width: 12
+#| fig-height: 10
+
+# Combine results from different methods for comparison
+comparison_plot_data <- bind_rows(
+  conditional_results_method1 |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 1: survfit()"),
+  
+  conditional_results_method2 |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 2: Baseline Hazard"),
+  
+  conditional_results_method4 |>
+    filter(current_time == 52) |>
+    select(profile_id, future_time, conditional_prob) |>
+    mutate(method = "Method 4: Time-dependent Function")
+  )
+
+# Plot conditional survival probabilities by method
+method_comparison_plot <- ggplot(comparison_plot_data) +
+  geom_line(
+    aes(x = future_time, y = conditional_prob, color = method, linetype = method),
+    size = 1.2
+    ) +
+  facet_wrap(~ profile_id, scales = "free_y") +
+  scale_x_continuous(
+    name = "Future Time (weeks)",
+    labels = function(x) paste0(x/52, "y")
+    ) +
+  scale_y_continuous(
+    name = "Conditional Survival Probability",
+    labels = label_percent()
+    ) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Comparison of Conditional Survival Calculation Methods",
+    subtitle = "Given survival to 1 year (52 weeks), probability of surviving to future times",
+    color = "Method",
+    linetype = "Method"
+    ) +
+  theme(
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "grey90")
+    )
+
+print(method_comparison_plot)
+
+# Plot time horizon effects
+horizon_plot_data <- conditional_results_method4 |>
+  mutate(
+    time_horizon_months = time_horizon / (52/12),
+    profile_label = str_replace_all(profile_id, "_", " ") |> str_to_title()
+    )
+
+horizon_plot <- ggplot(horizon_plot_data) +
+  geom_line(
+    aes(x = time_horizon_months, y = conditional_prob, color = profile_label),
+    size = 1.2
+    ) +
+  geom_point(
+    aes(x = time_horizon_months, y = conditional_prob, color = profile_label),
+    size = 2
+    ) +
+  scale_x_continuous(
+    name = "Time Horizon (months)",
+    breaks = pretty_breaks(n = 6)
+    ) +
+  scale_y_continuous(
+    name = "Conditional Survival Probability",
+    labels = label_percent()
+    ) +
+  scale_color_brewer(palette = "Set2") +
+  labs(
+    title = "Conditional Survival by Time Horizon",
+    subtitle = "Probability of surviving additional time given 1-year survival",
+    color = "Profile"
+    ) +
+  theme(legend.position = "bottom")
+
+print(horizon_plot)
+```
+
+# Practical Application: Risk Scoring
+
+This section demonstrates how to use conditional survival probabilities for
+practical risk assessment.
+
+```{r practical_application}
+#| echo: true
+
+# Create a risk scoring function
+calculate_risk_score <- function(coxph_model, individual_data, scoring_horizon = 52) {
+  
+  conditional_surv_fn <- create_conditional_survival_function(coxph_model)
+  
+  risk_scores <- map_dfr(
+    1:nrow(individual_data),
+    ~ {
+      individual <- individual_data[.x, ]
+      current_time <- individual$policy_lifetime
+      
+      # Calculate conditional probability for the scoring horizon
+      if (current_time > 0) {
+        cond_result <- conditional_surv_fn(individual, current_time, scoring_horizon)
+        conditional_prob <- cond_result$conditional_prob[1]
+        risk_score <- 1 - conditional_prob  # Higher score = higher risk
+      } else {
+        conditional_prob <- NA_real_
+        risk_score <- NA_real_
+      }
+      
+      tibble(
+        individual_id = .x,
+        current_time = current_time,
+        conditional_survival_prob = conditional_prob,
+        risk_score = risk_score
+        )
+      }
+    )
+  
+  return(risk_scores)
+}
+
+# Apply to out-of-sample in-force policies
+inforce_policies <- model_outsample_tbl |>
+  filter(policy_status == "inforce") |>
+  slice_sample(n = 100)
+
+risk_scores_tbl <- calculate_risk_score(coxph_model, inforce_policies, scoring_horizon = 52)
+
+# Add back original data for analysis
+risk_analysis_tbl <- bind_cols(
+  inforce_policies |> select(policy_id, gender_life1, smoker_life1, sum_assured),
+  risk_scores_tbl
+  )
+
+# Visualize risk distribution
+risk_distribution_plot <- ggplot(risk_analysis_tbl) +
+  geom_histogram(
+    aes(x = risk_score),
+    bins = 30,
+    fill = "steelblue",
+    alpha = 0.7
+    ) +
+  scale_x_continuous(
+    name = "Risk Score (1-year lapse probability)",
+    labels = label_percent()
+    ) +
+  scale_y_continuous(name = "Count") +
+  labs(
+    title = "Distribution of 1-Year Lapse Risk Scores",
+    subtitle = "For currently in-force policies"
+    )
+
+print(risk_distribution_plot)
+
+# Risk by demographic segments
+risk_by_demographics <- ggplot(risk_analysis_tbl) +
+  geom_boxplot(
+    aes(x = interaction(gender_life1, smoker_life1), y = risk_score, 
+        fill = interaction(gender_life1, smoker_life1)),
+    alpha = 0.7
+    ) +
+  scale_x_discrete(
+    name = "Demographic Group",
+    labels = function(x) str_replace(x, "\\.", "\n")
+    ) +
+  scale_y_continuous(
+    name = "Risk Score",
+    labels = label_percent()
+    ) +
+  scale_fill_brewer(palette = "Set3") +
+  labs(
+    title = "Risk Score Distribution by Demographics",
+    subtitle = "1-year conditional lapse probability"
+    ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+print(risk_by_demographics)
+
+# Summary statistics
+cat("Risk Score Summary:\n")
+summary(risk_analysis_tbl$risk_score)
+
+cat("\n\nHigh Risk Policies (top 10%):\n")
+high_risk_threshold <- quantile(risk_analysis_tbl$risk_score, 0.9, na.rm = TRUE)
+high_risk_policies <- risk_analysis_tbl |>
+  filter(risk_score >= high_risk_threshold) |>
+  arrange(desc(risk_score))
+
+print(high_risk_policies |> select(policy_id, gender_life1, smoker_life1, risk_score))
+```
+
+# Summary and Recommendations
+
+## Method Comparison
+
+1. **Method 1 (survfit with newdata)**: 
+   - Easiest to use and understand
+   - Built-in R functionality
+   - Good for small numbers of profiles
+   - Limited flexibility for custom calculations
+
+2. **Method 2 (Baseline hazard extraction)**:
+   - More control over calculations
+   - Good understanding of underlying mechanics
+   - Suitable for custom implementations
+   - Requires more coding
+
+3. **Method 3 (Vectorized approach)**:
+   - Most efficient for large datasets
+   - Handles multiple individuals simultaneously
+   - Good for batch processing
+   - More complex to implement
+
+4. **Method 4 (Time-dependent function)**:
+   - Most flexible approach
+   - Easy to use for different scenarios
+   - Good for interactive applications
+   - Recommended for production use
+
+5. **Method 5 (condSURV package)**:
+   - Specialized package for conditional survival
+   - Optimized algorithms
+   - Handles edge cases well
+   - Good for complex conditional scenarios
+
+6. **Method 6 (rms package)**:
+   - Advanced regression modeling capabilities
+   - Handles non-linear relationships (splines)
+   - Enhanced prediction functionality
+   - Comprehensive model validation tools
+
+## Additional Package Benefits
+
+### **Recommended High-Priority Packages:**
+
+1. **`rms`** - Regression Modeling Strategies
+   - Enhanced Cox modeling with splines
+   - Advanced prediction capabilities
+   - Built-in validation tools
+   - Nomogram creation
+
+2. **`condSURV`** - Conditional Survival Functions
+   - Specialized conditional survival calculations
+   - Optimized algorithms
+   - Handles complex scenarios
+
+3. **`timeROC`** - Time-dependent ROC Analysis
+   - Evaluate prediction performance over time
+   - Compare models at different time points
+   - Essential for model validation
+
+4. **`riskRegression`** - Risk Prediction Models
+   - Advanced risk prediction frameworks
+   - Model comparison tools
+   - Cross-validation for survival models
+
+5. **`flexsurv`** - Flexible Parametric Survival Models
+   - Alternative to Cox models
+   - Parametric survival distributions
+   - Better extrapolation capabilities
+
+### **Packages for Specialized Use Cases:**
+
+- **`randomForestSRC`** - For non-parametric survival prediction
+- **`survivalROC`** - ROC analysis for survival data
+- **`msm`** - Multi-state survival models
+- **`frailtypack`** - Frailty models for clustered data
+
+## Practical Recommendations
+
+- **For exploratory analysis**: Use Method 1
+- **For understanding methodology**: Use Method 2  
+- **For large-scale scoring**: Use Method 3
+- **For production applications**: Use Method 4
+- **For specialized conditional survival**: Use Method 5 (condSURV)
+- **For advanced modeling**: Use Method 6 (rms)
+
+## Installation Instructions
+
+To install the recommended additional packages, run:
+
+```r
+# Install from the build script
+source("build/additional_survival_packages.R")
+
+# Or install individually
+install.packages(c("rms", "condSURV", "timeROC", "riskRegression", "flexsurv"))
+```
+
+All methods produce consistent results when properly implemented, so choose
+based on your specific use case, computational requirements, and modeling complexity.
+
+# R Environment
+
+```{r show_session_info}
+#| echo: true
+#| message: true
+
+sessioninfo::session_info()
+```

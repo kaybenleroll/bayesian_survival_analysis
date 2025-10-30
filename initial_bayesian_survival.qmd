@@ -71,48 +71,29 @@ plan(multisession)
 ```
 
 
-# Load Policy Data
 
-We first need to load the policy data so we might visualise some of this data.
+# Load Data
 
-```{r load_policy_data}
+We first load up the data we are using to train our dataset, as well as the
+'rolled-forward' data that observes the same data a year later.
+
+```{r load_modelling_data}
 #| echo: TRUE
 
-policy_data_raw_tbl <- read_parquet("data/lifeins_policybook_inoutforce.parquet")
+model_training_tbl <- read_parquet("data/model_training_small_tbl.parquet")
 
-policy_data_raw_tbl |> glimpse()
+model_training_tbl |> glimpse()
 ```
 
-We now want to determine the observed lifetime of the policy, which depends
-on the status of the policy.
+We then load up the 'current' data that we use to validate our model.
 
 
-```{r determine_policy_lifetime}
-#| echo: FALSE
-
-policy_protection_data_tbl <- policy_data_raw_tbl |>
-  filter(prod_type == "protection") |>
-  mutate(
-    weeks_to_now    = difftime(as.Date("2016-01-01"),   policy_startdate, units = "weeks") |> as.numeric(),
-    weeks_to_status = difftime(policy_statuschangedate, policy_startdate, units = "weeks") |> as.numeric(),
-    
-    policy_lifetime = if_else(policy_status == "inforce", weeks_to_now, weeks_to_status)
-    )
-
-policy_protection_data_tbl |> glimpse()
-```
-
-
-We want to fit a more cutdown version of this model, so we sample 1,000 data
-points to help us assess our models.
-
-```{r sample_initial_modelling_data}
+```{r load_current_data}
 #| echo: TRUE
 
-model_data_tbl <- policy_protection_data_tbl |>
-  slice_sample(n = 10000)
+model_rollforward_tbl <- read_parquet("data/model_rollforward_small_tbl.parquet")
 
-model_data_tbl |> glimpse()
+model_rollforward_tbl |> glimpse()
 ```
 
 
@@ -126,10 +107,10 @@ stan_modeldir <- "stan_models"
 stan_codedir  <-   "stan_code"
 
 
-bfit <- brm(
-  policy_lifetime | cens(1-lapsed) ~ gender_life1 + smoker_life1 + isjointlife + islifeonly + mortgage_status,
-  data        = model_data_tbl,
-  family      = cox(),
+lapse1_brmfit <- brm(
+  policy_lifetime | cens(1-lapsed) ~ gender_life1 + smoker_life1,
+  data        = model_training_tbl,
+  family      = cox(link = "log"),
   cores       = 4,
   seed        = 421,
   save_warmup = FALSE,
@@ -143,7 +124,7 @@ bfit <- brm(
     )
   )
 
-summary(bfit)
+summary(lapse1_brmfit)
 
 ```
 

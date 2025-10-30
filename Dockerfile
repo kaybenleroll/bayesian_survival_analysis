@@ -16,6 +16,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     ditaa \
     graphviz \
     htop \
+    just \
     libclang-dev \
     libglpk-dev \
     libgsl-dev \
@@ -55,8 +56,11 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
   && install2.r --error \
     anytime \
     arrow \
+    asaur \
     bayesplot \
+    benchmarkme \
     brms \
+    broom \
     conflicted \
     cowplot \
     DataExplorer \
@@ -64,11 +68,14 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     fitdistrplus \
     fs \
     furrr \
+    ggsurvfit \
+    gtsummary \
     Hmisc \
     lifecontingencies \
     loo \
     markdown \
     modeltime \
+    muhaz \
     nanoparquet \
     posterior \
     projpred \
@@ -84,7 +91,6 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     snakecase \
     splines2 \
     survival \
-    survivalAnalysis \
     survivalmodels \
     survminer \
     survMisc \
