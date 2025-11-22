@@ -1,6 +1,9 @@
 .Rproj.user/
 .vscode/
 
+stan_model/*.csv
+stan_model/*.rds
+
 *_cache/*
 *_files/*
 
@@ -11,6 +14,7 @@
 .RData
 
 temp*
+tmp*
 
 *.log
 

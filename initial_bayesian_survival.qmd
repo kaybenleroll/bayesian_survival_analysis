@@ -24,8 +24,8 @@ format:
 
 
 ```{r import_libraries}
-#| echo: FALSE
-#| message: FALSE
+#| echo: false
+#| message: false
 
 library(conflicted)
 library(tidyverse)
@@ -44,9 +44,13 @@ library(posterior)
 library(bayesplot)
 library(tidybayes)
 library(splines2)
+library(rstanarm)
 
 
 source("lib_utils.R")
+source("lib_brms_hazard.R")
+source("lib_survival_modelling.R")
+source("lib_cashflow_projection.R")
 
 
 conflict_lst <- resolve_conflicts(
@@ -60,6 +64,9 @@ options(
   warn  = 1,
   mc.cores = parallelly::availableCores()
   )
+
+stan_modeldir <- "stan_model"
+stan_codedir  <- "stan_code"
 
 
 set.seed(42)
@@ -78,7 +85,7 @@ We first load up the data we are using to train our dataset, as well as the
 'rolled-forward' data that observes the same data a year later.
 
 ```{r load_modelling_data}
-#| echo: TRUE
+#| echo: true
 
 model_training_tbl <- read_parquet("data/model_training_small_tbl.parquet")
 
@@ -89,7 +96,7 @@ We then load up the 'current' data that we use to validate our model.
 
 
 ```{r load_current_data}
-#| echo: TRUE
+#| echo: true
 
 model_rollforward_tbl <- read_parquet("data/model_rollforward_small_tbl.parquet")
 
@@ -100,22 +107,26 @@ model_rollforward_tbl |> glimpse()
 
 # Build Initial Cox Model
 
-```{r build_initial_cox_model}
-#| echo: FALSE
 
-stan_modeldir <- "stan_models"
-stan_codedir  <-   "stan_code"
+## brms Model
 
+```{r build_initial_cox_model_brms}
+#| echo: true
 
-lapse1_brmfit <- brm(
+stanmodel_name <- "lapse1_coxph"
+
+lapse1_coxph_brmsfit <- brm(
   policy_lifetime | cens(1-lapsed) ~ gender_life1 + smoker_life1,
-  data        = model_training_tbl,
-  family      = cox(link = "log"),
-  cores       = 4,
-  seed        = 421,
-  save_warmup = FALSE,
-  backend     = "cmdstanr",
-  save_model  = "stan_code/brm_cox.stan",
+  data            = model_training_tbl,
+  family          = cox(link = "log"),
+  cores           = 4,
+  seed            = 421,
+  save_warmup     = FALSE,
+  backend         = "cmdstanr",
+  save_model      = glue("{stan_codedir}/{stanmodel_name}.stan"),
+  file            = glue("{stan_modeldir}/{stanmodel_name}_brmsfit"),
+  output_dir      = stan_modeldir,
+  output_basename = stanmodel_name,
 
   stan_model_args = list(
     include_paths   =     "stan_code",
@@ -124,7 +135,275 @@ lapse1_brmfit <- brm(
     )
   )
 
-summary(lapse1_brmfit)
+summary(lapse1_coxph_brmsfit)
+```
+
+
+## rstanarm Model
+
+
+```{r build_initial_cox_model_rstanarm}
+#| echo: true
+
+stanmodel_name <- "lapse1_coxph_stansurv"
+stanmodel_file <- glue("{stan_modeldir}/{stanmodel_name}.rds")
+
+# Check if fitted model exists, load it if so, otherwise fit new model
+if (file_exists(stanmodel_file)) {
+  write_lines(glue("Loading cached model from {stanmodel_file}"), stdout())
+  lapse1_coxph_stansurv <- read_rds(stanmodel_file)
+} else {
+  write_lines(glue("Fitting new model, will save to {stanmodel_file}"), stdout())
+  
+  # Create stan_model directory if it doesn't exist
+  dir_create(stan_modeldir, recurse = TRUE)
+  
+  lapse1_coxph_stansurv <- stan_surv(
+    Surv(policy_lifetime, lapsed) ~ gender_life1 + smoker_life1,
+    data   = model_training_tbl,
+    
+    # MCMC sampling parameters
+    chains = 4,
+    iter   = 2000,
+    warmup = 1000,
+    seed   = 4000,
+    cores  = 4,
+    
+    # Baseline hazard specification
+    basehaz     = "ms",  # M-splines (flexible, default)
+    basehaz_ops = list(df = 6),  # Degrees of freedom for baseline hazard
+    
+    # Prior specifications (explicit is better than implicit)
+    prior           = rstanarm::normal(location = 0, scale = 2.5),  # Weakly informative for coefficients
+    prior_intercept = rstanarm::normal(location = 0, scale = 10),  # For baseline hazard
+    )
+  
+  # Save fitted model for future use
+  write_rds(lapse1_coxph_stansurv, stanmodel_file)
+  write_lines(glue("Model saved to {stanmodel_file}"), stdout())
+}
+
+summary(lapse1_coxph_stansurv)
+```
+
+
+# Construct Posterior Survival Estimates
+
+We now want to use our fitted model to predict the lapse for the portfolio.
+
+We model the monthly paid premia in the portfolio for the final year for which
+we have data. We can then compare our modelled cashflows against the observed
+data.
+
+## Set Up Monthly Dates
+
+```{r create_monthly_estimates}
+#| echo: true
+
+monthly_tbl <- tibble(
+  date = seq(as.Date("2015-01-01"), as.Date("2016-02-01"), by = "month"),
+  weeks = difftime(date, as.Date("2015-01-01"), units = "weeks") |> as.numeric()
+  )
+
+monthly_tbl |> glimpse()
+```
+
+
+
+
+
+## Extract Posterior Estimates
+
+
+```{r construct_brms_posterior_estimates}
+#| echo: true
+
+inforce_tbl <- model_training_tbl |>
+  filter(status_at_reference_date  == "inforce")
+
+post_draws_lst <- posterior_survfit(
+    lapse1_coxph_stansurv,
+    newdata       = inforce_tbl,
+    last_time     = NULL,
+    draws         = 2000,
+    condition     = TRUE,
+    return_matrix = TRUE
+    )
+
+post_draws_lst[[1]] |> glimpse()
+```
+
+
+```{r extract_posterior_survival_estimates}
+#| echo: true
+
+cashflow_week_count <- monthly_tbl |> pull(weeks)
+
+post_survival_tbl <- post_draws_lst |>
+  map_dfr(
+    extract_stansurv_posterior_survivals,
+
+    .progress = "extract_post_surv"
+    ) |>
+  filter(time < 5 * 52) |>
+  mutate(
+    policy_id = inforce_tbl$policy_id[idx],
+    
+    .before = 1
+    ) |>
+  select(policy_id, draw_id, time, post_surv_prob = value) |>
+  interpolate_survival_data(
+    new_times = cashflow_week_count
+    ) |>
+  group_nest(policy_id, draw_id)
+
+post_survival_tbl |> glimpse()
+```
+
+
+
+```{r calculate_sim_lapse_times}
+#| echo: true
+
+sim_lapse_times_tbl <- post_survival_tbl |>
+  mutate(
+    rnd_draw   = runif(n(), 0, 1),
+    lapse_time = map2_dbl(
+      data, rnd_draw,
+      \(x, y) extract_survival_time(x, y, min_time = 1),
+
+      .progress = "extract_survival_time"
+      )
+    ) |>
+  select(policy_id, draw_id, lapse_time)
+
+sim_lapse_times_tbl |> glimpse()
+```
+
+
+
+```{r construct_policy_sim_data}
+#| echo: true
+
+policy_cutdown_tbl <- model_training_tbl |>
+  select(policy_id, policy_startdate, policy_enddate, prem_ape)
+
+sim_policy_data_tbl <- sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+
+      # Policy has expired (term ended)
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+
+      # Policy has lapsed and the lapse occurred before or on the reference date
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01")) ~ "lapsed",
+
+      # Policy is within term and either not lapsed or lapsed after reference date
+      as.Date("2016-01-01") <= policy_enddate ~ "inforce",
+
+      # Default case (shouldn't occur with proper data)
+      TRUE ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+
+sim_policy_data_tbl |> glimpse()
+```
+
+
+## Construct Actual Cashflow Data
+
+```{r construct_monthly_cashflows}
+#| echo: true
+
+actual_cashflows_tbl <- model_rollforward_tbl |>
+  semi_join(inforce_tbl, by = "policy_id") |>
+  calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date)
+
+actual_cashflows_tbl |> glimpse()
+```
+
+We now add the cashflows across all the policies to get the total monthly
+cashflow observed in the data.
+
+```{r construct_monthly_actual_cashflow}
+#| echo: true
+
+actual_monthly_tbl <- actual_cashflows_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+
+actual_monthly_tbl |> glimpse()
+```
+
+
+We now construct the simulated cashflows from the simulated data.
+
+
+```{r construct_simulated_cashflows}
+#| echo: true
+
+sim_cashflow_tbl <- sim_policy_data_tbl |>
+  group_nest(draw_id) |>
+  mutate(
+    newdata = map(
+      data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+                  
+      .progress = "joining_data")
+      ) |>
+  select(-data) |>
+  unnest(newdata)
+
+sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r construct_simulated_monthly_cashflows}
+#| echo: true
+
+sim_monthly_cashflow_tbl <- sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r construct_comparison_plot}
+#| echo: true
+
+ggplot(sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    )
+
 
 ```
 

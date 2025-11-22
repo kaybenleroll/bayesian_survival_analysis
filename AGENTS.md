@@ -38,6 +38,7 @@ bayesian_survival_analysis/
 
 ### Library Files
 - **`lib_survival_modelling.R`**: Survival analysis helper functions (including `determine_policy_status()`)
+- **`lib_brms_hazard.R`**: brms Cox model baseline hazard extraction and visualization functions
 - **`lib_utils.R`**: General utility functions (conflict resolution, etc.)
 - **`policy_status_functions.R`**: Policy-specific business logic
 
@@ -108,9 +109,26 @@ bayesian_survival_analysis/
 
 ### Stan/brms Models
 1. **Model naming**: Use descriptive names indicating model type and iteration
-2. **Always set seed**: Use `stanfit_seed <- 4000` for reproducibility
+2. **Always set seed**: Use `seed = 4000` (or similar) for reproducibility
 3. **Document priors**: Comment on prior choices in text
-4. **Save fitted models**: Use `saveRDS()` for large models to avoid refitting
+4. **Save fitted models**: Use `file` argument in `brm()` to automatically cache fitted models
+5. **cmdstanr backend**: Use `backend = "cmdstanr"` for better performance
+6. **Model caching**: 
+   - Use `file = "fitted_models/model_name"` to save/load fitted models automatically
+   - Use `output_dir = "stan_output"` to control where CSV samples are stored
+   - Use `output_basename = "model_name"` to give CSV files readable names (not UUIDs)
+   - Example:
+     ```r
+     brm(
+       formula,
+       data = data_tbl,
+       family = cox(),
+       backend = "cmdstanr",
+       file = "fitted_models/lapse1_brmsfit",
+       output_dir = "stan_output",
+       output_basename = "lapse1_brmsfit"
+     )
+     ```
 
 ## Domain-Specific Context
 
@@ -192,10 +210,13 @@ When comparing datasets (e.g., rollback vs current):
 just docker-run
 ```
 
-This starts RStudio Server on port 8787 with volume mapping to workspace.
+This starts RStudio Server on port 8787 with:
+- User namespace mapping (`--userns=keep-id`) for proper file ownership
+- Volume mapping to workspace with SELinux support (`:z` flag)
+- RUNROOTLESS=false to allow RStudio Server to function properly
 
 ### Common Issues
-- **Permission issues**: Container runs as `rstudio` user; use `:z` flag for SELinux
+- **SELinux contexts**: Volume uses `:z` flag for proper SELinux labeling
 - **Package installation**: Add to `build/docker_install_user_rpkgs.R`
 - **System dependencies**: Add to `build/docker_install_sys_rpkgs.R`
 
@@ -207,6 +228,7 @@ This starts RStudio Server on port 8787 with volume mapping to workspace.
 - **survminer**: Enhanced survival visualizations
 - **ggsurvfit**: Modern survival curve plotting
 - **brms**: Bayesian regression models using Stan
+- **tidybayes**: Tidy data extraction from Bayesian models
 - **arrow**: Reading parquet files
 - **cowplot**: Publication-quality plots
 - **DataExplorer**: Automated exploratory data analysis
@@ -218,6 +240,26 @@ This starts RStudio Server on port 8787 with volume mapping to workspace.
 - **gtsummary**: Publication-ready tables
 - **conflicted**: Namespace conflict management
 - **lubridate**: Date/time operations
+
+### Bayesian Analysis Tools
+The `lib_brms_hazard.R` library provides functions for working with brmsfit Cox models:
+- **`extract_baseline_hazard()`**: Extract baseline hazard as tidy tibble with time, draw_id, and hazard values
+- **`extract_cumulative_hazard()`**: Extract cumulative baseline hazard
+- **`extract_baseline_survival()`**: Extract baseline survival function
+- **`plot_baseline_hazard()`**: Visualize baseline hazard with uncertainty
+- **`plot_baseline_survival()`**: Visualize baseline survival with uncertainty
+
+All extraction functions support `summary = TRUE` to return summary statistics (mean, median, credible intervals) instead of individual draws.
+
+**Implementation Details**:
+- Uses the stored M-spline basis matrix from `brmsfit_obj$basis$dpars$mu$bhaz$basis_matrix`
+- Extracts time points directly from `brmsfit_obj$data[[time_var]]` (the actual observation times)
+- Computes baseline hazard as: `basis_matrix %*% sbhaz_coefs` (no exponentiation needed)
+- `sbhaz` represents actual hazard coefficients, not log hazard
+- Cumulative hazard computed via `cumsum()` for each posterior draw
+- No dependency on `splines2` package - uses brms' stored basis directly
+
+**Note**: These functions extract from the actual fitted model components, ensuring consistency with brms' internal calculations. Avoid reconstructing spline bases manually.
 
 ## Best Practices
 
@@ -353,6 +395,20 @@ This starts RStudio Server on port 8787 with volume mapping to workspace.
 
 ## Recent Updates & Known Issues
 
+### lib_brms_hazard.R Implementation (November 2025)
+- Functions now use stored basis matrix from `brmsfit_obj$basis$dpars$mu$bhaz$basis_matrix`
+- Time points extracted from actual data: `brmsfit_obj$data[[time_var]]`
+- No longer reconstructs splines - uses brms' internal representations
+- `sbhaz` coefficients represent actual hazard (not log hazard) - no exponentiation needed
+- Removed dependency on `splines2` package
+- Summary statistics computed using `summarise()` instead of `median_qi()` to avoid metadata warnings
+
+### Docker/Podman Configuration (November 2025)
+- Uses `--userns=keep-id` flag to map container user to host user (maintains file ownership)
+- Requires `RUNROOTLESS=false` for RStudio Server to function properly
+- Volume mount uses `:z` SELinux flag for proper file access permissions
+- Configuration allows seamless file editing both inside and outside container
+
 ### Age Calculation (October 2025)
 - Removed all references to `age_life1` from models
 - Updated `determine_policy_status()` to calculate ages from `dob_life1`
@@ -390,5 +446,5 @@ This starts RStudio Server on port 8787 with volume mapping to workspace.
 
 ---
 
-**Last Updated**: October 29, 2025  
+**Last Updated**: November 12, 2025  
 **Maintainer**: Mick Cooney (mcooney@describedata.com)

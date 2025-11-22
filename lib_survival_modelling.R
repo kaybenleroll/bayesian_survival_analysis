@@ -87,10 +87,10 @@ determine_policy_status <- function(policy_data_tbl, reference_date) {
         ),
 
         weeks_to_refdate    = difftime(
-          reference_date,          policy_startdate, units = "months"
+          reference_date,          policy_startdate, units = "weeks"
           ) |> as.numeric(),
         weeks_to_statusdate = difftime(
-          policy_statuschangedate, policy_startdate, units = "months"
+          policy_statuschangedate, policy_startdate, units = "weeks"
           ) |> as.numeric(),
 
         policy_lifetime = if_else(
@@ -121,4 +121,54 @@ determine_policy_status <- function(policy_data_tbl, reference_date) {
 
   return(updated_tbl)
 }
+
+
+extract_stansurv_posterior_survivals <- function(post_lst) {
+  time_vals <- post_lst |> attr('times')
+
+  rep_count <- post_lst |> nrow()
+
+  post_surv_tbl <- post_lst |>
+    reshape2::melt() |>
+    rename(
+      draw_id = iterations,
+      idx     = ids
+    ) |>
+    as_tibble() |>
+    mutate(
+      time = rep(time_vals, rep_count)
+    )
+
+  return(post_surv_tbl)
+}
+
+
+interpolate_survival_data <- function(surv_data_tbl, new_times) {
+  interp_survdata_tbl <- surv_data_tbl |>
+    reframe(
+      interp_time    = new_times,
+      post_surv_prob = approx(time, post_surv_prob, xout = new_times)$y,
+
+      .by = c(policy_id, draw_id)
+    )
+
+  return(interp_survdata_tbl)
+}
+
+
+extract_survival_time <- function(data_tbl, rng_draw, min_time) {
+  valid_idx <- data_tbl$post_surv_prob > rng_draw
+
+  if (!any(valid_idx)) {
+    return(NA_real_)  # No valid times (u > all survival probabilities)
+  }
+
+  # Get the last TRUE index (highest time where surv_prob > u)
+  max_idx <- max(which(valid_idx))
+
+  lapse_time <- pmax(data_tbl$interp_time[max_idx], min_time)
+
+  return(lapse_time)
+}
+
 

@@ -74,16 +74,17 @@ docker-show-context:
 # Run Docker container
 docker-run:
 	docker run --rm -d \
-		--userns=keep-id \
-		-e RUNROOTLESS=false \
+	  --userns=keep-id \
+	  -e RUNROOTLESS=false \
 	  -p "127.0.0.1:{{RSTUDIO_PORT}}:8787" \
-		-e USER={{DOCKER_USER}} \
-		-e PASSWORD={{DOCKER_PASS}} \
-		-e USERID={{DOCKER_UID}} \
-		-e GROUPID={{DOCKER_GID}} \
-		-v "{{PWD}}:/home/rstudio/{{PROJECT_FOLDER}}:z" \
-		--name {{CONTAINER_NAME}} \
-		{{IMAGE_TAG}}
+	  -e USER={{DOCKER_USER}} \
+	  -e PASSWORD={{DOCKER_PASS}} \
+	  -e USERID={{DOCKER_UID}} \
+	  -e GROUPID={{DOCKER_GID}} \
+	  -v "{{PWD}}:/home/rstudio/{{PROJECT_FOLDER}}:z" \
+	  -v "{{PWD}}/.rstudio_copilot:/home/rstudio/.config/github-copilot:rw" \
+	  --name {{CONTAINER_NAME}} \
+	  {{IMAGE_TAG}}
 
 # Fix Docker container permissions
 docker-fix-permissions:

@@ -1,4 +1,4 @@
-FROM rocker/tidyverse:4.5.0
+FROM rocker/tidyverse:4.5.1
 
 #COPY build/Rprofile.site /usr/local/lib/R/etc/
 #COPY build/Renviron.site /usr/local/lib/R/etc/
@@ -24,6 +24,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     libomp-dev \
     p7zip-full \
     pbzip2 \
+    plocate \
     rsyslog \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* \
@@ -84,7 +85,6 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     quarto \
     regplot \
     rstan \
-    rstanarm \
     sessioninfo \
     shinybrms \
     shinystan \
@@ -112,10 +112,13 @@ RUN git clone https://github.com/lindenb/makefile2graph.git \
   && cd makefile2graph \
   && make \
   && make install
-  
+
 RUN cp -r $HOME/.R /home/rstudio \
   && chown -R rstudio:rstudio /home/rstudio/.R
 
+# Enable GitHub Copilot at server level
+RUN mkdir -p /etc/rstudio && \
+  echo "copilot-enabled=1" >> /etc/rstudio/rsession.conf
 
 WORKDIR /home/rstudio
 USER rstudio

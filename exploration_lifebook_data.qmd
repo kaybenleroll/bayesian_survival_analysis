@@ -1441,7 +1441,10 @@ of the policy, which depends on the status of the policy.
 #| echo: FALSE
 
 policy_protection_data_tbl <- data_tbl |>
-  filter(prod_type == "protection") |>
+  filter(
+    prod_type == "protection",
+    prem_freq == 12
+    ) |>
   select(-weeks_to_now, -weeks_to_status, -policy_lifetime)
 
 policy_protection_data_tbl |> glimpse()
