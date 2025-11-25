@@ -729,8 +729,6 @@ We now clean up the environment before building the next model.
 lapse2_post_survival_tbl |> write_parquet(glue("{stan_modeldir}/lapse2_post_survival_tbl.parquet"))
 lapse2_sim_cashflow_tbl  |> write_parquet(glue("{stan_modeldir}/lapse2_sim_cashflow_tbl.parquet"))
 
-# Note: lapse2_post_draws_lst already saved in posterior construction chunk
-
 # Remove large objects
 rm(lapse2_post_survival_tbl, lapse2_post_draws_lst, lapse2_sim_cashflow_tbl)
 
