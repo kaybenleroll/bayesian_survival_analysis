@@ -56,6 +56,10 @@ bayesian_survival_analysis/
    - Suffix tibbles with `_tbl`: `data_tbl`, `model_data_tbl`, `summary_tbl`
    - Suffix plots with `_plot`: `survival_plot`, `hazard_plot`
    - Suffix models with model type: `lapse1_km`, `lapse2_coxph`
+   - **Shared vs Model-Specific objects**:
+     - **NO prefix** for objects shared across all models: `model_training_tbl`, `inforce_tbl`, `monthly_tbl`, `actual_monthly_tbl`
+     - **Use `lapseN_` prefix** for model-specific objects: `lapse1_coxph_stansurv`, `lapse2_post_draws_lst`, `lapse3_sim_cashflow_tbl`
+     - This convention makes it immediately clear which objects are reused vs. model-specific
 3. **Function naming**: Verb-noun pattern when possible
 4. **Namespace conflicts**: Always resolve using `conflicted` package (see `lib_utils.R`)
 5. **Avoid base R shortcuts**: Use tidyverse pipelines instead of `$` accessor and `sum(df$col)`
@@ -106,6 +110,24 @@ bayesian_survival_analysis/
 3. **Add narrative text** before and after code chunks explaining what's being done
 4. **Figures**: Set appropriate `fig-width` and `fig-height` in chunk options at the start of the notebook
 5. **Output formatting**: Use `write_lines()` from readr for text output to ensure clean rendering
+6. **Code organization for multi-model notebooks**:
+   - Create shared data objects in a dedicated section after data loading
+   - Use clear section headers like "Create Shared Data Objects"
+   - Front-load all objects that will be reused across models (monthly dates, subsets, lookups)
+   - This reduces duplication and makes dependencies explicit
+
+### Data Persistence
+1. **File formats**:
+   - Use **parquet** for tibbles: `object_tbl |> write_parquet("path/to/file.parquet")`
+   - Use **RDS** for complex nested structures (lists, model objects): `object_lst |> write_rds("path/to/file.rds")`
+   - Parquet provides better compression, portability, and performance for tabular data
+2. **Always use pipe notation**: `object |> write_parquet(path)` not `write_parquet(object, path)`
+3. **Save before remove**: When clearing large objects, save them first for reproducibility
+   ```r
+   # Save before removing
+   large_tbl |> write_parquet(glue("{output_dir}/large_tbl.parquet"))
+   rm(large_tbl)
+   ```
 
 ### Stan/brms Models
 1. **Model naming**: Use descriptive names indicating model type and iteration
@@ -277,6 +299,32 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 4. **Compare models**: Use AIC, BIC, concordance for comparison
 5. **Visualize results**: Always include appropriate plots
 
+### When Working with Multi-Model Notebooks
+1. **Identify shared objects early**: Determine which objects are used across all models
+2. **Create a dedicated section**: Place "Create Shared Data Objects" after data loading
+3. **Clear naming conventions**: No prefix for shared objects, `modelN_` prefix for model-specific
+4. **Front-load common computations**: Monthly dates, subsets, lookup tables, actual cashflows
+5. **Document dependencies**: Use comments to explain which objects depend on others
+6. **Example structure**:
+   ```r
+   # Load Data section
+   model_training_tbl <- read_parquet(...)
+   model_rollforward_tbl <- read_parquet(...)
+   
+   # Create Shared Data Objects section
+   monthly_tbl <- tibble(...)
+   inforce_tbl <- model_training_tbl |> filter(...)
+   actual_monthly_tbl <- model_rollforward_tbl |> ...
+   
+   # Build Model 1 section
+   lapse1_coxph <- stan_surv(..., data = model_training_tbl)
+   lapse1_predictions <- predict(lapse1_coxph, newdata = inforce_tbl)
+   
+   # Build Model 2 section
+   lapse2_coxph <- stan_surv(..., data = model_training_tbl)
+   lapse2_predictions <- predict(lapse2_coxph, newdata = inforce_tbl)
+   ```
+
 ### When Debugging
 1. **Check data first**: Use `glimpse()`, `summary()`, `count()`
 2. **Verify dimensions**: Ensure expected row counts after filters/joins
@@ -395,6 +443,16 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 
 ## Recent Updates & Known Issues
 
+### Notebook Refactoring: Shared Objects and File Formats (November 2025)
+- Standardized naming convention: shared objects have NO prefix, model-specific objects use `lapseN_` prefix
+- Reorganized `initial_bayesian_survival.qmd`: moved shared objects to dedicated section after data loading
+- Shared objects: `model_training_tbl`, `model_rollforward_tbl`, `monthly_tbl`, `inforce_tbl`, `policy_cutdown_tbl`, `actual_monthly_tbl`, `cashflow_week_count`
+- Model-specific objects: `lapse1_coxph_stansurv`, `lapse2_post_draws_lst`, `lapse3_sim_cashflow_tbl`, etc.
+- Changed file saves from RDS to parquet for tibbles (better portability and performance)
+- All write operations now use pipe notation: `object |> write_parquet(path)`
+- Complex list structures still use RDS format
+- See `prompts.md` for the comprehensive prompt that achieved this refactoring
+
 ### lib_brms_hazard.R Implementation (November 2025)
 - Functions now use stored basis matrix from `brmsfit_obj$basis$dpars$mu$bhaz$basis_matrix`
 - Time points extracted from actual data: `brmsfit_obj$data[[time_var]]`
@@ -446,5 +504,5 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 
 ---
 
-**Last Updated**: November 12, 2025  
+**Last Updated**: November 25, 2025  
 **Maintainer**: Mick Cooney (mcooney@describedata.com)

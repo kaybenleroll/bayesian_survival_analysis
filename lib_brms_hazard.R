@@ -1,8 +1,3 @@
-library(tidyverse)
-library(brms)
-library(tidybayes)
-
-
 #' Extract baseline hazard from a brmsfit Cox model
 #'
 #' This function extracts the baseline hazard function from a brmsfit object

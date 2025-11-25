@@ -14,6 +14,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     bzip2 \
     clang \
     ditaa \
+    gh \
     graphviz \
     htop \
     just \

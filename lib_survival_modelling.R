@@ -1,6 +1,3 @@
-library(tidyverse)
-library(lubridate)
-
 #' Determine policy status at a given date
 #'
 #' This function takes a tibble of policy data and a reference date,
@@ -123,6 +120,29 @@ determine_policy_status <- function(policy_data_tbl, reference_date) {
 }
 
 
+#' Extract Posterior Survival Probabilities from rstanarm Model
+#'
+#' Reshapes posterior survival probability matrix from rstanarm::posterior_survfit()
+#' into a tidy long-format tibble suitable for analysis and visualization.
+#' The input is typically a matrix with dimensions (draws × time_points).
+#'
+#' @param post_lst Posterior survival matrix from rstanarm::posterior_survfit()
+#'   with attribute 'times' containing the time points
+#'
+#' @return Tibble with columns:
+#'   - draw_id: Posterior draw identifier (iteration number)
+#'   - idx: Original index position in the posterior matrix
+#'   - value: Survival probability at this time point
+#'   - time: Time value corresponding to this survival probability
+#'
+#' @examples
+#' # Fit Cox model and extract posterior survival
+#' fit <- stan_surv(Surv(time, event) ~ x1 + x2, data = data_tbl)
+#' post_surv <- posterior_survfit(fit, newdata = newdata_tbl)
+#'
+#' # Convert to tidy format
+#' post_surv_tbl <- extract_stansurv_posterior_survivals(post_surv)
+#'
 extract_stansurv_posterior_survivals <- function(post_lst) {
   time_vals <- post_lst |> attr('times')
 
@@ -143,6 +163,33 @@ extract_stansurv_posterior_survivals <- function(post_lst) {
 }
 
 
+#' Interpolate Survival Probabilities to New Time Points
+#'
+#' Performs linear interpolation of survival curves to evaluate them at new
+#' time points. This is useful when you need survival probabilities at specific
+#' times not in the original posterior draws (e.g., monthly or weekly intervals).
+#'
+#' @param surv_data_tbl Tibble with survival data containing columns:
+#'   - policy_id: Policy identifier
+#'   - draw_id: Posterior draw identifier
+#'   - time: Original time points
+#'   - post_surv_prob: Survival probabilities at original times
+#' @param new_times Numeric vector: New time points at which to evaluate survival
+#'
+#' @return Tibble with columns:
+#'   - policy_id: Policy identifier
+#'   - draw_id: Posterior draw identifier
+#'   - interp_time: New interpolated time points
+#'   - post_surv_prob: Interpolated survival probabilities
+#'
+#' @examples
+#' # Interpolate survival to monthly intervals
+#' monthly_times <- seq(0, 520, by = 4)  # Weeks to months
+#' monthly_surv_tbl <- interpolate_survival_data(
+#'   post_surv_tbl,
+#'   new_times = monthly_times
+#' )
+#'
 interpolate_survival_data <- function(surv_data_tbl, new_times) {
   interp_survdata_tbl <- surv_data_tbl |>
     reframe(
@@ -156,6 +203,34 @@ interpolate_survival_data <- function(surv_data_tbl, new_times) {
 }
 
 
+#' Extract Survival Time from Survival Curve Using Random Draw
+#'
+#' Implements inverse transform sampling to generate event times from a survival
+#' curve. Given a uniform random draw u ~ U(0,1), finds the time t where S(t) = u.
+#' This is the inverse of the survival CDF and is used for simulating event times.
+#'
+#' @param data_tbl Tibble with single survival curve containing columns:
+#'   - interp_time: Time points (must be sorted)
+#'   - post_surv_prob: Survival probabilities at those times
+#' @param rng_draw Numeric: Random uniform draw between 0 and 1
+#' @param min_time Numeric: Minimum time to return (floor value)
+#'
+#' @return Numeric: Simulated event time (or NA if no valid time exists)
+#'
+#' @examples
+#' # Simulate lapse time from survival curve
+#' surv_curve_tbl <- tibble(
+#'   interp_time = seq(0, 520, by = 4),
+#'   post_surv_prob = exp(-0.001 * interp_time)  # Exponential survival
+#' )
+#'
+#' # Generate random lapse time
+#' u <- runif(1)
+#' lapse_time <- extract_survival_time(surv_curve_tbl, u, min_time = 0)
+#'
+#' # Simulate many lapse times
+#' lapse_times <- map_dbl(runif(1000), ~ extract_survival_time(surv_curve_tbl, .x, 0))
+#'
 extract_survival_time <- function(data_tbl, rng_draw, min_time) {
   valid_idx <- data_tbl$post_surv_prob > rng_draw
 

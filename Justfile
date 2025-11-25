@@ -92,4 +92,4 @@ docker-fix-permissions:
 
 # Enter Docker container bash
 docker-bash:
-	docker exec -it {{CONTAINER_NAME}} bash
+	docker exec -u {{DOCKER_USER}} -it {{CONTAINER_NAME}} bash
