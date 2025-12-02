@@ -1,5 +1,6 @@
 .Rproj.user/
 .vscode/
+.just-cache/
 
 stan_model/*.csv
 stan_model/*.rds

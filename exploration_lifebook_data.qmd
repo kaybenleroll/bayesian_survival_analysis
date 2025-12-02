@@ -58,25 +58,39 @@ resolve_conflicts <- function(pkg_priority) {
 }
 ```
 
-```{r create_chunk_timing}
+```{r setup_chunk_timing}
 #| echo: false
+#| message: false
 
-knitr::knit_hooks$set(timeit = local({
-  now <- NULL
+# Enable chunk timing for all chunks
+knitr::opts_chunk$set(time_it = TRUE)
 
-  function(before, options) {
-    if(before) {
-      now <<- Sys.time()
-    } else {
-      res <- Sys.time() |> difftime(now) |> round(2)
-      now <<- NULL
+# Create a list to store chunk times
+chunk_times <- list()
 
-      # use options$label if you want the chunk label as well
-      message(glue("Time for code chunk: {options$label} is {res} secs"))
-    }
-
-  }})
-)
+# Create a hook to capture chunk execution times
+knitr::knit_hooks$set(time_it = function(before, options) {
+  if (before) {
+    # Record start time in global environment
+    assign(".chunk_start_time", Sys.time(), envir = .GlobalEnv)
+  } else {
+    # Calculate elapsed time
+    elapsed <- difftime(
+      Sys.time(),
+      get(".chunk_start_time", envir = .GlobalEnv),
+      units = "secs"
+      ) |>
+      as.numeric()
+    
+    # Store in global list
+    chunk_times <- get("chunk_times", envir = .GlobalEnv)
+    chunk_times[[options$label]] <- elapsed
+    assign("chunk_times", chunk_times, envir = .GlobalEnv)
+    
+    # Print timing message
+    message(glue("⏱️  Chunk '{options$label}': {round(elapsed, 2)} seconds"))
+  }
+})
 ```
 
 ```{r import_libraries}
@@ -1970,9 +1984,83 @@ model_rollforward_large_tbl |> glimpse()
 ```
 
 
+## Construct Filtered Modelling Datasets (Premium < 15k, Start >= 2005)
+
+We now construct a second set of modelling datasets with additional filters:
+- Only policies with prem_ape < 15,000
+- Only policies starting from 2005-01-01 onwards
+
+This allows us to focus on more recent, lower-premium policies.
+
+```{r filter_rollback_data_for_recent}
+#| echo: true
+
+rollback_data_filtered_tbl <- rollback_data_tbl |>
+  filter(
+    prem_ape < 15000,
+    policy_startdate >= as.Date("2005-01-01")
+    )
+
+message(glue(
+  "Filtered rollback data: {nrow(rollback_data_filtered_tbl)} policies ",
+  "(from {nrow(rollback_data_tbl)} original)"
+))
+
+rollback_data_filtered_tbl |> glimpse()
+```
+
+With the filtered data prepared, we now create our training datasets by sampling from the filtered rollback data. We follow the same two-size approach as before: a large dataset for more comprehensive analysis and a small dataset for faster iteration and testing.
+
+```{r sample_filtered_modelling_data_large}
+#| echo: true
+
+model_training_filtered_large_tbl <- rollback_data_filtered_tbl |>
+  slice_sample(n = modelling_dataset_size_large) |>
+  arrange(policy_id)
+
+model_training_filtered_large_tbl |> glimpse()
+```
+
+The small filtered dataset is created as a subset of the large filtered dataset, ensuring consistency between the two samples. This allows us to test model specifications on the smaller dataset before applying them to the larger one.
+
+```{r sample_filtered_modelling_data_small}
+#| echo: true
+
+model_training_filtered_small_tbl <- model_training_filtered_large_tbl |>
+  slice_sample(n = modelling_dataset_size_small) |>
+  arrange(policy_id)
+
+model_training_filtered_small_tbl |> glimpse()
+```
+
+Next, we create the corresponding rollforward datasets by selecting policies from the current data that match those in our training samples. These rollforward datasets represent the same policies at a later point in time, allowing us to validate model predictions and perform out-of-time testing.
+
+```{r sample_filtered_rollforward_small}
+#| echo: true
+
+model_rollforward_filtered_small_tbl <- current_data_tbl |>
+  semi_join(model_training_filtered_small_tbl, by = "policy_id")
+
+model_rollforward_filtered_small_tbl |> glimpse()
+```
+
+We repeat the same process for the large dataset, creating a rollforward version that tracks the same policies forward in time.
+
+```{r sample_filtered_rollforward_large}
+#| echo: true
+
+model_rollforward_filtered_large_tbl <- current_data_tbl |>
+  semi_join(model_training_filtered_large_tbl, by = "policy_id")
+
+model_rollforward_filtered_large_tbl |> glimpse()
+```
+
+With all filtered datasets created, we now have four new datasets: training and rollforward versions in both small and large sizes. These datasets focus on more recent policies with lower premiums, which may exhibit different lapse behavior patterns than the full population.
+
+
 ## Write Out Datasets
 
-Finally, we write out the datasets.
+Finally, we write out all the datasets to parquet files for use in subsequent analysis notebooks. This includes both the original unfiltered datasets and the new filtered versions, giving us flexibility in our modeling approach.
 
 ```{r write_out_datasets}
 #| echo: true
@@ -1984,6 +2072,61 @@ model_training_large_tbl    |> write_parquet("data/model_training_large_tbl.parq
 
 model_rollforward_small_tbl |> write_parquet("data/model_rollforward_small_tbl.parquet")
 model_rollforward_large_tbl |> write_parquet("data/model_rollforward_large_tbl.parquet")
+
+model_training_filtered_small_tbl    |> write_parquet("data/model_training_filtered_small_tbl.parquet")
+model_training_filtered_large_tbl    |> write_parquet("data/model_training_filtered_large_tbl.parquet")
+
+model_rollforward_filtered_small_tbl |> write_parquet("data/model_rollforward_filtered_small_tbl.parquet")
+model_rollforward_filtered_large_tbl |> write_parquet("data/model_rollforward_filtered_large_tbl.parquet")
+```
+
+
+
+# Chunk Timing Summary
+
+This section summarizes the execution time for all chunks in this notebook.
+
+```{r chunk_timing_summary}
+#| echo: false
+
+# Create timing summary table
+timing_summary_tbl <- tibble(
+    chunk_label = names(chunk_times),
+    seconds = unlist(chunk_times)
+    ) |>
+  arrange(desc(seconds)) |>
+  mutate(
+    minutes = round(seconds / 60, 2),
+    hours = round(seconds / 3600, 2),
+    formatted = case_when(
+      seconds < 60 ~ glue("{round(seconds, 1)} sec"),
+      seconds < 3600 ~ glue("{minutes} min"),
+      TRUE ~ glue("{hours} hr")
+      )
+    )
+
+# Print summary
+message("")
+message(strrep("=", 80))
+message("CHUNK EXECUTION TIMES (slowest first)")
+message(strrep("=", 80))
+message("")
+
+timing_summary_tbl |>
+  select(chunk_label, formatted) |>
+  print(n = Inf)
+
+message("")
+message(strrep("-", 80))
+total_time <- sum(timing_summary_tbl$seconds)
+message(glue("Total execution time: {round(total_time/60, 2)} minutes ({round(total_time, 1)} seconds)"))
+message(strrep("=", 80))
+
+# Save to file for future reference
+dir_create("chunk_timings", recurse = TRUE)
+timing_output_file <- glue("chunk_timings/exploration_chunk_timings_{format(Sys.time(), '%Y%m%d_%H%M%S')}.parquet")
+timing_summary_tbl |> write_parquet(timing_output_file)
+message(glue("Timing data saved to: {timing_output_file}"))
 ```
 
 

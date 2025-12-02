@@ -31,15 +31,17 @@ bayesian_survival_analysis/
 ## Key Files
 
 ### Analysis Notebooks (Quarto .qmd)
-- **`exploration_lifebook_data.qmd`**: Exploratory data analysis, data quality checks, dataset preparation
+- **`exploration_lifebook_data.qmd`**: Exploratory data analysis, data quality checks, dataset preparation (includes chunk timing)
 - **`classic_survival_models.qmd`**: Classical survival models (Kaplan-Meier, Cox-PH)
-- **`initial_bayesian_survival.qmd`**: Bayesian survival models using Stan/brms
+- **`initial_bayesian_survival.qmd`**: Bayesian survival models (lapse1/2/3) using Stan/rstanarm with small dataset (includes manual caching and chunk timing)
+- **`bayesian_survival_filtered_data.qmd`**: Same structure as initial but with filtered small dataset (prem_ape < 15k, start >= 2005) and filterlapse1/2/3 prefixes (includes manual caching and chunk timing)
 - **`conditional_survival_prediction.qmd`**: Methods for calculating conditional survival probabilities
 
 ### Library Files
 - **`lib_survival_modelling.R`**: Survival analysis helper functions (including `determine_policy_status()`)
 - **`lib_brms_hazard.R`**: brms Cox model baseline hazard extraction and visualization functions
-- **`lib_utils.R`**: General utility functions (conflict resolution, etc.)
+- **`lib_stan_diagnostics.R`**: Stan/rstanarm MCMC diagnostics (convergence and mixing plots)
+- **`lib_utils.R`**: General utility functions (conflict resolution, `write_parquet_compressed()`, etc.)
 - **`policy_status_functions.R`**: Policy-specific business logic
 
 ### Build & Infrastructure
@@ -109,23 +111,48 @@ bayesian_survival_analysis/
 2. **Use descriptive chunk labels**: `load_policy_data`, `fit_coxph1_model`
 3. **Add narrative text** before and after code chunks explaining what's being done
 4. **Figures**: Set appropriate `fig-width` and `fig-height` in chunk options at the start of the notebook
-5. **Output formatting**: Use `write_lines()` from readr for text output to ensure clean rendering
+5. **Output formatting**: Use `message()` for informational output, `write_lines()` for formatted text blocks
 6. **Code organization for multi-model notebooks**:
    - Create shared data objects in a dedicated section after data loading
    - Use clear section headers like "Create Shared Data Objects"
    - Front-load all objects that will be reused across models (monthly dates, subsets, lookups)
    - This reduces duplication and makes dependencies explicit
+7. **Chunk timing**: Add automatic timing using knitr hooks:
+   ```r
+   chunk_times <- list()
+   
+   knitr::knit_hooks$set(
+     time_it = function(before, options, envir) {
+       if (before) {
+         chunk_times[[options$label]] <<- list(start = Sys.time())
+       } else {
+         chunk_times[[options$label]]$end <<- Sys.time()
+         chunk_times[[options$label]]$elapsed <<-
+           chunk_times[[options$label]]$end |>
+           difftime(chunk_times[[options$label]]$start) |>
+           as.numeric()
+       }
+     }
+   )
+   
+   knitr::opts_chunk$set(time_it = TRUE)
+   ```
+   - Add timing summary section before R Environment to display and save results
+   - Saves timing data to `chunk_timings/` directory as parquet files
 
 ### Data Persistence
 1. **File formats**:
-   - Use **parquet** for tibbles: `object_tbl |> write_parquet("path/to/file.parquet")`
-   - Use **RDS** for complex nested structures (lists, model objects): `object_lst |> write_rds("path/to/file.rds")`
+   - Use **parquet** for tibbles: `object_tbl |> write_parquet_compressed("path/to/file.parquet")`
+   - Use **qs** for complex nested structures (lists, model objects): `object_lst |> qsave("path/to/file.qs")`
    - Parquet provides better compression, portability, and performance for tabular data
-2. **Always use pipe notation**: `object |> write_parquet(path)` not `write_parquet(object, path)`
-3. **Save before remove**: When clearing large objects, save them first for reproducibility
+   - qs package is 2-10x faster than RDS with better compression
+2. **Always use pipe notation**: `object |> write_parquet_compressed(path)` not `write_parquet(object, path)`
+3. **Parquet compression**: Use `write_parquet_compressed()` wrapper (from `lib_utils.R`) for zstd level 3 compression
+4. **qs settings**: Use `preset = "balanced"` for good speed/compression tradeoff
+5. **Save before remove**: When clearing large objects, save them first for reproducibility
    ```r
    # Save before removing
-   large_tbl |> write_parquet(glue("{output_dir}/large_tbl.parquet"))
+   large_tbl |> write_parquet_compressed(glue("{output_dir}/large_tbl.parquet"))
    rm(large_tbl)
    ```
 
@@ -151,6 +178,17 @@ bayesian_survival_analysis/
        output_basename = "lapse1_brmsfit"
      )
      ```
+7. **Manual caching for large objects**: For posterior draws and derived objects, use manual caching:
+   ```r
+   cache_file <- "stan_model/lapse1_post_draws_lst.qs"
+   if (file_exists(cache_file)) {
+     lapse1_post_draws_lst <- qread(cache_file)
+   } else {
+     lapse1_post_draws_lst <- posterior_survfit(...)
+     lapse1_post_draws_lst |> qsave(cache_file, preset = "balanced")
+   }
+   ```
+8. **Stan output visibility**: Set `daemon: false` in YAML execute options and `refresh = 200` in `stan_surv()`
 
 ## Domain-Specific Context
 
@@ -225,6 +263,27 @@ When comparing datasets (e.g., rollback vs current):
 5. Confirm static variables remain unchanged
 6. Use `write_lines()` for reporting check results
 
+### Dataset Variants
+The project maintains multiple dataset variants for different analyses:
+1. **Size variants** (created in `exploration_lifebook_data.qmd`):
+   - `model_training_small_tbl.parquet` / `model_rollforward_small_tbl.parquet`: Base datasets
+   - `model_training_large_tbl.parquet` / `model_rollforward_large_tbl.parquet`: Larger sample
+   
+2. **Filtered variants** (created in `exploration_lifebook_data.qmd`):
+   - `model_training_filtered_large_tbl.parquet` / `model_rollforward_filtered_large_tbl.parquet`
+   - `model_training_filtered_small_tbl.parquet` / `model_rollforward_filtered_small_tbl.parquet`
+   - Filters: `prem_ape < 15000`, `policy_startdate >= 2005-01-01`
+
+3. **Usage pattern**:
+   - `initial_bayesian_survival.qmd`: Uses small datasets with lapse1/2/3 prefixes
+   - `bayesian_survival_filtered_data.qmd`: Uses filtered small datasets with filterlapse1/2/3 prefixes
+   - Use `data_dir` variable for configurable paths: `data_dir <- "data"`
+
+4. **Naming convention**:
+   - Training data: Used for model fitting
+   - Rollforward data: Used for predictions and validation
+   - Prefix model objects to match dataset: `lapse1_*` for small, `filterlapse1_*` for filtered
+
 ## Docker & Environment
 
 ### Running the Container
@@ -249,12 +308,16 @@ This starts RStudio Server on port 8787 with:
 - **survival**: Classical survival analysis
 - **survminer**: Enhanced survival visualizations
 - **ggsurvfit**: Modern survival curve plotting
+- **rstanarm**: Bayesian regression models using Stan (used for `stan_surv()`)
 - **brms**: Bayesian regression models using Stan
 - **tidybayes**: Tidy data extraction from Bayesian models
-- **arrow**: Reading parquet files
-- **cowplot**: Publication-quality plots
+- **arrow**: Reading/writing parquet files with multi-threading support
+- **qs**: Fast serialization for R objects (2-10x faster than RDS)
+- **cowplot**: Publication-quality plots and multi-panel layouts
+- **bayesplot**: MCMC diagnostics and visualization
 - **DataExplorer**: Automated exploratory data analysis
 - **glue**: String interpolation for messages
+- **fs**: Cross-platform file system operations
 
 ### Analysis-Specific
 - **muhaz**: Hazard function estimation
@@ -264,6 +327,8 @@ This starts RStudio Server on port 8787 with:
 - **lubridate**: Date/time operations
 
 ### Bayesian Analysis Tools
+
+#### brms Cox Models (lib_brms_hazard.R)
 The `lib_brms_hazard.R` library provides functions for working with brmsfit Cox models:
 - **`extract_baseline_hazard()`**: Extract baseline hazard as tidy tibble with time, draw_id, and hazard values
 - **`extract_cumulative_hazard()`**: Extract cumulative baseline hazard
@@ -282,6 +347,94 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 - No dependency on `splines2` package - uses brms' stored basis directly
 
 **Note**: These functions extract from the actual fitted model components, ensuring consistency with brms' internal calculations. Avoid reconstructing spline bases manually.
+
+#### rstanarm Cox Models (lib_survival_modelling.R)
+The `lib_survival_modelling.R` library provides functions for working with rstanarm Cox models:
+- **`extract_stansurv_baseline_hazard(stanfit, summary=FALSE, n=1000)`**: Extract baseline hazard from `stan_surv()` fitted objects
+  - Returns tidy tibble with time, draw_id, and baseline_hazard columns
+  - Supports `summary=TRUE` to return mean, median, and 95% CI instead of individual draws
+  - Time points generated uniformly from min to max observed times
+- **`compare_baseline_hazards(stansurv_fit, coxph_fit, max_time=Inf, plot_type="cumulative_hazard", n=1000, prob=0.95)`**: Compare Bayesian and frequentist baseline hazards or survival curves
+  - Overlays `stan_surv()` and `coxph()` estimates
+  - Supports three plot types: `"cumulative_hazard"` (default), `"instantaneous_hazard"`, or `"survival"`
+  - Returns list with plot and comparison data tibble
+  - Use `max_time` to restrict time range (e.g., `max_time=156` for 3 years in weeks)
+
+**Implementation Details (rstanarm)**:
+- M-spline basis stored in `stanfit$basehaz$basis` object
+- M-spline coefficients stored as `m-splines-coef1`, `m-splines-coef2`, etc. in posterior draws
+- Basis evaluated at time points using `predict(basehaz$basis, times)`
+- Baseline hazard computed as: `exp(intercept) * (aux %*% t(basis_mat))` (intercept optional)
+- For comparison: interpolates `coxph()` estimates to match `stan_surv()` time points using `approx()`
+- Cumulative hazard from `basehaz()`, instantaneous from numeric differentiation
+
+**Usage Pattern**:
+```r
+# After fitting models
+lapse1_coxph_stansurv <- stan_surv(...)
+lapse1_coxph <- coxph(...)
+
+# Extract baseline hazard
+baseline_hazard_tbl <- extract_stansurv_baseline_hazard(lapse1_coxph_stansurv)
+
+# Compare cumulative hazards (restricted to 3 years)
+comparison_lst <- compare_baseline_hazards(
+  lapse1_coxph_stansurv,
+  lapse1_coxph,
+  max_time = 156,  # 3 years in weeks
+  plot_type = "cumulative_hazard"
+)
+comparison_lst$plot
+
+# Compare survival curves
+survival_comparison_lst <- compare_baseline_hazards(
+  lapse1_coxph_stansurv,
+  lapse1_coxph,
+  max_time = 156,
+  plot_type = "survival"
+)
+survival_comparison_lst$plot
+```
+
+### Stan Diagnostics Tools
+The `lib_stan_diagnostics.R` library provides functions for MCMC diagnostics on Stan/rstanarm models:
+- **`plot_stan_convergence(stanfit_obj, max_rhat)`**: 3-panel convergence diagnostics
+  - Rhat values plot (convergence indicator)
+  - Effective sample size ratio plot
+  - Text summary of diagnostics
+  - Returns cowplot grid with 14x5 inch dimensions
+
+- **`plot_stan_mixing(stanfit_obj, pars, n_draws_overlay, max_lag)`**: Mixing and autocorrelation diagnostics
+  - Auto-selects 6 parameters with lowest n_eff ratios when `pars = NULL`
+  - Displays comma-separated list of selected parameters
+  - Trace plots for chains convergence
+  - Density overlays for posterior distribution
+  - Autocorrelation plots for chain mixing
+  - Returns cowplot grid with 14x10 inch dimensions
+
+**Usage Pattern**:
+```r
+# After fitting Stan model
+lapse1_coxph_stansurv <- stan_surv(...)
+
+# Convergence diagnostics
+plot_stan_convergence(lapse1_coxph_stansurv)
+
+# Mixing diagnostics (auto-selects worst 6 parameters)
+plot_stan_mixing(lapse1_coxph_stansurv)
+```
+
+**Implementation Notes**:
+- Functions use bare package names (no `::` prefixes)
+- Auto-excludes baseline hazard parameters (sbhaz)
+- Smart parameter selection based on n_eff ratios
+- Integrates bayesplot functions for standard MCMC diagnostics
+
+### Performance Optimization
+- **Arrow threading**: Set `arrow::set_cpu_count()` and `arrow::set_io_thread_count()` for parallel I/O
+- **Parquet compression**: Use `write_parquet_compressed()` wrapper for zstd level 3 compression (see `lib_utils.R`)
+- **qs package**: Use `qsave()`/`qread()` with `preset = "balanced"` for R objects (2-10x faster than RDS)
+- **Manual caching**: Use `file_exists()` pattern for objects >2GB to avoid R's long vector limitations
 
 ## Best Practices
 
@@ -443,15 +596,75 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 
 ## Recent Updates & Known Issues
 
-### Notebook Refactoring: Shared Objects and File Formats (November 2025)
+### Performance Optimization & File Formats (November 2025)
+- **Switched from RDS to qs package**: 2-10x faster serialization for R objects
+  - All model objects and lists now use `.qs` extension with `qsave()`/`qread()`
+  - Use `preset = "balanced"` for good speed/compression tradeoff
+- **Arrow optimization**: Configured multi-threaded I/O for parquet operations
+  - `set_cpu_count()` and `set_io_thread_count()` set in notebook setup
+  - Provides 2-4x speedup for large file operations
+- **Parquet compression**: Created `write_parquet_compressed()` wrapper in `lib_utils.R`
+  - Uses zstd compression level 3 by default
+  - Reduces file sizes significantly without performance penalty
+- **Pipe notation standardization**: All file writes use pipe notation
+  - `object_tbl |> write_parquet_compressed(path)`
+  - `object_lst |> qsave(path, preset = "balanced")`
+
+### Chunk Timing Infrastructure (November 2025)
+- **Automatic chunk timing**: Added knitr hooks to all main notebooks
+  - Tracks start/end time for every chunk
+  - Uses `difftime()` with multiline indentation and `|>` pipe operator
+  - Saves timing data to `chunk_timings/` directory as parquet files
+- **Timing summary sections**: All notebooks include comprehensive timing reports
+  - Displays chunks sorted by execution time (slowest first)
+  - Formats times as seconds, minutes, or hours based on duration
+  - Shows total execution time for entire notebook
+- **Notebooks with timing**: `initial_bayesian_survival.qmd`, `bayesian_survival_filtered_data.qmd`, `exploration_lifebook_data.qmd`
+
+### Manual Caching Strategy (November 2025)
+- **Implemented comprehensive caching**: 15 expensive chunks per modeling notebook
+  - Stan models: `lapse1/2/3_coxph_stansurv.qs` (and `filterlapse1/2/3_*` variants)
+  - Posterior draws: `lapse1/2/3_post_draws_lst.qs`
+  - Survival estimates: `lapse1/2/3_post_survival_tbl.parquet`
+  - Simulated lapse times: `lapse1/2/3_sim_lapse_times_tbl.parquet`
+  - Cashflows: `lapse1/2/3_sim_cashflow_tbl.parquet`
+- **Caching pattern**: `file_exists()` → `qread()`/`read_parquet()` → compute → `qsave()`/`write_parquet_compressed()`
+- **Rationale**: Manual caching avoids R's "long vectors not supported" limitation with Quarto's built-in cache
+
+### Stan Diagnostics Library (November 2025)
+- **Created `lib_stan_diagnostics.R`**: Comprehensive MCMC diagnostic functions
+  - `plot_stan_convergence()`: Rhat, ESS ratio, diagnostics summary (3-panel, 14x5 inches)
+  - `plot_stan_mixing()`: Trace plots, density overlays, autocorrelation (2+1 panels, 14x10 inches)
+- **Smart parameter selection**: `plot_stan_mixing()` auto-selects 6 parameters with lowest n_eff ratios
+  - Displays comma-separated list of selected parameters with 80-character wrapping
+  - Makes diagnostic plots more useful by focusing on problematic parameters
+- **Code style**: Functions use bare package names (no `::` prefixes) for cleaner code
+
+### Dataset Variants & Filtered Data (November 2025)
+- **Multiple dataset variants**: Standard and filtered versions for different analysis needs
+  - Small: Used in `initial_bayesian_survival.qmd` with `lapse1/2/3` prefixes
+  - Filtered small: Used in `bayesian_survival_filtered_data.qmd` with `filterlapse1/2/3` prefixes
+- **Filtered datasets**: Created filtered variants in `exploration_lifebook_data.qmd`
+  - Filter criteria: `prem_ape < 15000`, `policy_startdate >= 2005-01-01`
+  - Both training and rollforward versions for small and large sizes
+  - Files: `model_*_filtered_{large|small}_tbl.parquet`
+  - Focus on more recent policies with lower premiums for homogeneous analysis
+- **Configurable paths**: Use `data_dir` variable to avoid hardcoded paths
+
+### Visualization Enhancements (November 2025)
+- **Added ribbon plots**: All three models now have both line plots and ribbon plots
+  - Ribbon plots show 50% and 80% credible intervals for uncertainty visualization
+  - Applied to both all-policies and recent-policies (2010+) views
+- **Shared data organization**: Moved common data definitions to dedicated section
+  - `actual_monthly_tbl` and `actual_monthly_recent_tbl` created once and reused
+  - Reduces duplication and makes dependencies explicit
+
+### Notebook Refactoring: Shared Objects and Naming (November 2025)
 - Standardized naming convention: shared objects have NO prefix, model-specific objects use `lapseN_` prefix
 - Reorganized `initial_bayesian_survival.qmd`: moved shared objects to dedicated section after data loading
 - Shared objects: `model_training_tbl`, `model_rollforward_tbl`, `monthly_tbl`, `inforce_tbl`, `policy_cutdown_tbl`, `actual_monthly_tbl`, `cashflow_week_count`
 - Model-specific objects: `lapse1_coxph_stansurv`, `lapse2_post_draws_lst`, `lapse3_sim_cashflow_tbl`, etc.
-- Changed file saves from RDS to parquet for tibbles (better portability and performance)
-- All write operations now use pipe notation: `object |> write_parquet(path)`
-- Complex list structures still use RDS format
-- See `prompts.md` for the comprehensive prompt that achieved this refactoring
+- All write operations use pipe notation with appropriate compression
 
 ### lib_brms_hazard.R Implementation (November 2025)
 - Functions now use stored basis matrix from `brmsfit_obj$basis$dpars$mu$bhaz$basis_matrix`
@@ -502,7 +715,48 @@ All extraction functions support `summary = TRUE` to return summary statistics (
 - Applied consistently across all function calls and ggplot layers
 - See early sections of `exploration_lifebook_data.qmd` for examples
 
+### Quarto Caching Strategy (November 2025)
+- **Manual caching** for Stan models and large posterior objects (recommended approach)
+- Use `file_exists()` + `read_rds()`/`write_rds()` pattern for explicit control
+- Avoid Quarto's built-in `#| cache: true` for very large objects (>2GB) due to R's "long vectors not supported" limitation
+- Posterior draws from `posterior_survfit()` should use manual caching to RDS files
+- Downstream processing chunks (simulations, cashflows) can use Quarto caching with `#| cache: true`
+- Manual caching provides: explicit invalidation control, persistence across renders, smaller cache files
+
+### Stan Output Configuration (November 2025)
+- Use `#| results: hide` (not `#| output: false`) for console-only Stan progress
+- Set `refresh = 200` in `stan_surv()` for progress updates every 200 iterations
+- Add `cat()` + `flush.console()` before/after Stan calls for Docker visibility
+- Docker may buffer stderr (where Stan writes) - use unbuffered output when needed
+- Stan sampling messages go to stderr, not stdout
+
+### Output Functions in Quarto (November 2025)
+- Prefer `message()` over `cat()` for informational output
+- Use `message(glue("text: {variable}"))` for string interpolation
+- `message()` writes to stderr (separable from results) and can be suppressed
+- Still use `write_lines(text, stdout())` for formatted text blocks in output
+
+### rstanarm Baseline Hazard Extraction (November 2025)
+- **Created baseline hazard extraction functions** for `stan_surv()` fitted objects in `lib_survival_modelling.R`
+  - `extract_stansurv_baseline_hazard()`: Extracts M-spline-based baseline hazard from rstanarm Cox models
+  - `compare_baseline_hazards()`: Compares Bayesian (stan_surv) and frequentist (coxph) baseline hazards
+- **Technical discoveries**:
+  - M-spline coefficients stored as `m-splines-coef1` through `m-splines-coefN` (not `s-basehaz`)
+  - Basis matrix accessed via `stanfit$basehaz$basis` and evaluated with `predict()`
+  - Formula: `exp(intercept) * (aux %*% t(basis_mat))` where aux is (n_draws × n_coefs) and basis_mat is (n_coefs × n_times)
+  - Matrix multiplication order critical: results in (n_draws × n_times) hazard matrix
+  - Data arrangement: Use `rep(times, times=n_draws)` and `rep(1:n_draws, each=n_times)` for proper tibble structure
+- **Validation approach**:
+  - Compared output with `plot(stanfit, plotfun="basehaz")` internal implementation
+  - Examined rstanarm source code from feature/survival branch to understand M-spline representation
+  - Confirmed exact match using `all.equal()` between extracted and plotted values
+- **Comparison methodology**:
+  - Uses `approx()` to interpolate coxph estimates to stan_surv time points
+  - Supports cumulative hazard, instantaneous hazard, and survival curve comparison
+  - Survival curves computed as S(t) = exp(-H(t)) from cumulative hazards
+  - Applies time restrictions via `max_time` parameter (e.g., 156 weeks = 3 years)
+
 ---
 
-**Last Updated**: November 25, 2025  
+**Last Updated**: November 28, 2025  
 **Maintainer**: Mick Cooney (mcooney@describedata.com)

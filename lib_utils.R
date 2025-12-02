@@ -155,9 +155,8 @@ calculate_distribution_qvals <- function(data_tbl, distrib_vals, ref_val, ...) {
     group_by(..., {{ ref_val }}) |>
     summarise(
       .groups = "drop",
-
       dval_lst = list({{ distrib_vals }})
-      ) %>%
+      ) |>
     mutate(
       q_val = map2_dbl(dval_lst, {{ref_val}}, ~ ecdf(.x)(.y))
       )
@@ -195,4 +194,37 @@ ensure_exists_precompute_directory <- function(precompute_path) {
   write_lines("*.rds", gitignore_path)
 
   return(FALSE)
+}
+
+
+#' Write Parquet File with Default Compression
+#'
+#' Wrapper around arrow::write_parquet that sets zstd compression at level 3
+#' by default for optimal balance between file size and write performance.
+#' All other arguments are passed through to arrow::write_parquet.
+#'
+#' @param x Data frame or tibble to write
+#' @param sink File path or connection to write to
+#' @param ... Additional arguments passed to arrow::write_parquet
+#'   (compression and compression_level can be overridden)
+#'
+#' @return NULL (invisible). Function called for side effect of writing file.
+#'
+#' @examples
+#' # Write with default zstd level 3 compression
+#' data_tbl |> write_parquet_compressed("output.parquet")
+#'
+#' # Override compression level if needed
+#' data_tbl |> write_parquet_compressed("output.parquet", compression_level = 5)
+#'
+#' # Use different compression algorithm
+#' data_tbl |> write_parquet_compressed("output.parquet", compression = "snappy")
+#'
+write_parquet_compressed <- function(x, sink, ...) {
+  write_parquet(
+    x, sink,
+    compression = "zstd",
+    compression_level = 3,
+    ...
+  )
 }

@@ -71,7 +71,9 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     fs \
     furrr \
     ggsurvfit \
+    gt \
     gtsummary \
+    kableExtra \
     Hmisc \
     lifecontingencies \
     loo \
@@ -83,6 +85,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     projpred \
     prophet \
     pryr \
+    qs \
     quarto \
     regplot \
     rstan \
@@ -117,9 +120,12 @@ RUN git clone https://github.com/lindenb/makefile2graph.git \
 RUN cp -r $HOME/.R /home/rstudio \
   && chown -R rstudio:rstudio /home/rstudio/.R
 
-# Enable GitHub Copilot at server level
+# Enable GitHub Copilot and configure session timeouts
 RUN mkdir -p /etc/rstudio && \
-  echo "copilot-enabled=1" >> /etc/rstudio/rsession.conf
+  echo "copilot-enabled=1" >> /etc/rstudio/rsession.conf && \
+  echo "session-timeout-minutes=120" >> /etc/rstudio/rsession.conf && \
+  echo "session-timeout-suspend=0" >> /etc/rstudio/rsession.conf && \
+  echo "auth-timeout-minutes=0" >> /etc/rstudio/rserver.conf
 
 WORKDIR /home/rstudio
 USER rstudio

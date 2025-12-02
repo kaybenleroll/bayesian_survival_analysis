@@ -120,6 +120,346 @@ determine_policy_status <- function(policy_data_tbl, reference_date) {
 }
 
 
+#' Extract Baseline Hazard from rstanarm stan_surv Fitted Object
+#'
+#' Extracts the baseline hazard function from a Cox proportional hazards model
+#' fitted using rstanarm::stan_surv(). The function evaluates the M-spline
+#' basis at specified time points and computes the baseline hazard for each
+#' posterior draw. Follows the same computational approach as 
+#' plot(stanfit, plotfun = "basehaz").
+#'
+#' For Cox-PH models, the baseline hazard represents the hazard when all
+#' covariates are at their reference values. The function uses the M-spline
+#' coefficients and basis stored in the fitted model to compute 
+#' h_0(t) = basis(t) %*% coefficients.
+#'
+#' @param stanfit A stansurv object from rstanarm::stan_surv()
+#' @param summary Logical: return summary statistics (TRUE) or all draws (FALSE)?
+#'   Default FALSE returns all posterior draws
+#' @param n Integer: number of time points to evaluate (default 1000)
+#'
+#' @return Tibble with baseline hazard estimates:
+#'   If summary = FALSE: time, draw_id, baseline_hazard
+#'   If summary = TRUE: time, mean_hazard, median_hazard, lower_ci, upper_ci
+#'
+#' @examples
+#' # Extract all posterior draws
+#' baseline_hazard_tbl <- extract_stansurv_baseline_hazard(lapse1_coxph_stansurv)
+#' 
+#' # Get summary statistics with 95% credible intervals
+#' hazard_summary_tbl <- extract_stansurv_baseline_hazard(
+#'   lapse1_coxph_stansurv, 
+#'   summary = TRUE,
+#'   n = 500
+#' )
+extract_stansurv_baseline_hazard <- function(stanfit, summary = FALSE, n = 1000) {
+
+  # Validate the object
+  if (!inherits(stanfit, "stansurv")) {
+    stop("This function requires a 'stansurv' object from stan_surv()")
+  }
+
+  # Get time range from the data
+  # Use the same sequence generation as plot.stansurv
+  t_min <- min(stanfit$entrytime)
+  t_max <- max(stanfit$eventtime)
+  times <- seq(t_min, t_max, by = (t_max - t_min) / n)
+  
+  # Extract baseline hazard structure and parameters
+  # Following the pattern from plot.stansurv in plots.R
+  basehaz <- stanfit$basehaz
+  
+  # Extract parameter draws
+  stanmat <- as.matrix(stanfit$stanfit)
+  
+  # Get aux parameters (these contain the M-spline coefficients)
+  nms_aux <- colnames(stanmat)[grep("^m-splines-coef", colnames(stanmat))]
+  if (length(nms_aux) == 0) {
+    stop("Cannot find baseline hazard spline coefficients (m-splines-coef) in Stan output.")
+  }
+  aux <- stanmat[, nms_aux, drop = FALSE]
+  
+  # Get intercept (alpha) if present
+  nms_int <- grep("^\\(Intercept\\)$", colnames(stanmat), value = TRUE)
+  if (length(nms_int) > 0) {
+    intercept <- stanmat[, nms_int, drop = FALSE]
+  } else {
+    intercept <- NULL
+  }
+  
+  # Evaluate baseline hazard at the specified times
+  # This uses the same internal logic as plot(stanfit, plotfun = "basehaz")
+  # The formula is: basehaz = exp(intercept) * (aux %*% basis(times))
+  # For Cox models without intercept: basehaz = aux %*% basis(times)
+  
+  # Get the M-spline basis matrix at the specified times
+  basis_mat <- predict(basehaz$basis, times)
+  
+  # Compute baseline hazard for each draw
+  n_draws <- nrow(aux)
+  n_times <- length(times)
+  
+  # Matrix multiplication: (n_draws x n_coefs) %*% (n_coefs x n_times)
+  hazard_matrix <- aux %*% t(basis_mat)
+  
+  if (!is.null(intercept)) {
+    # With intercept: exp(intercept) * (aux %*% basis)
+    # Use sweep to multiply each row by exp(intercept)
+    hazard_matrix <- sweep(hazard_matrix, 1, as.vector(exp(intercept)), `*`)
+  }
+  # Without intercept (typical for Cox): hazard_matrix is already computed
+  
+  # Convert to tidy tibble format
+  # hazard_matrix is (n_draws x n_times)
+  # We want to arrange as: all times for draw 1, all times for draw 2, etc.
+  hazard_draws_tbl <- tibble(
+    time = rep(times, times = n_draws),
+    draw_id = rep(1:n_draws, each = n_times),
+    baseline_hazard = as.vector(t(hazard_matrix))
+  )
+  
+  if (summary) {
+    hazard_summary_tbl <- hazard_draws_tbl |>
+      group_by(time) |>
+      summarise(
+        mean_hazard   = mean(baseline_hazard),
+        median_hazard = median(baseline_hazard),
+        lower_ci      = quantile(baseline_hazard, 0.025),
+        upper_ci      = quantile(baseline_hazard, 0.975),
+        .groups       = "drop"
+        )
+
+    return(hazard_summary_tbl)
+  }
+
+  return(hazard_draws_tbl)
+}
+
+
+#' Compare Baseline Hazards or Survival Curves from stan_surv and coxph Models
+#'
+#' Compares baseline hazard or survival estimates from a Bayesian stan_surv model 
+#' and a frequentist coxph model. Returns both visualization and comparison data.
+#' Supports instantaneous hazard, cumulative hazard, and survival curve comparisons.
+#'
+#' The comparison evaluates stan_surv's smooth M-spline baseline hazard against
+#' coxph's Breslow step-function estimator. Cumulative hazard comparison is 
+#' more stable and recommended as the default. Survival curves are computed from
+#' cumulative hazards using S(t) = exp(-H(t)).
+#'
+#' @param stansurv_fit Stansurv object from rstanarm::stan_surv()
+#' @param coxph_fit Coxph object from survival::coxph()
+#' @param max_time Numeric: maximum time for comparison (weeks). Default Inf
+#' @param plot_type Character: type of comparison - "cumulative_hazard" (default),
+#'   "instantaneous_hazard", or "survival"
+#' @param n Integer: number of evaluation points for stan_surv (default 1000)
+#' @param prob Numeric: credible interval probability (default 0.95)
+#'
+#' @return List with two elements:
+#'   - plot: ggplot object with comparison
+#'   - data: tibble with time, stansurv estimates (median, CI), coxph values
+#'
+#' @examples
+#' # Compare cumulative hazards up to 3 years (156 weeks)
+#' comparison <- compare_baseline_hazards(
+#'   stansurv_fit = lapse1_coxph_stansurv,
+#'   coxph_fit = lapse1_coxph,
+#'   max_time = 156,
+#'   plot_type = "cumulative_hazard"
+#' )
+#' 
+#' print(comparison$plot)
+#' head(comparison$data)
+#' 
+#' # Compare survival curves
+#' comparison2 <- compare_baseline_hazards(
+#'   stansurv_fit = lapse1_coxph_stansurv,
+#'   coxph_fit = lapse1_coxph,
+#'   max_time = 156,
+#'   plot_type = "survival"
+#' )
+#' 
+#' # Compare instantaneous hazards
+#' comparison3 <- compare_baseline_hazards(
+#'   stansurv_fit = lapse1_coxph_stansurv,
+#'   coxph_fit = lapse1_coxph,
+#'   max_time = 156,
+#'   plot_type = "instantaneous_hazard"
+#' )
+#'
+compare_baseline_hazards <- function(stansurv_fit, 
+                                    coxph_fit, 
+                                    max_time = Inf,
+                                    plot_type = "cumulative_hazard",
+                                    n = 1000,
+                                    prob = 0.95) {
+  
+  # Validate plot_type
+  valid_types <- c("cumulative_hazard", "instantaneous_hazard", "survival")
+  if (!plot_type %in% valid_types) {
+    stop("plot_type must be one of: ", paste(valid_types, collapse = ", "))
+  }
+  
+  # Extract baseline hazard from stan_surv
+  if (plot_type %in% c("cumulative_hazard", "survival")) {
+    # Get all draws for cumulative hazard computation
+    stansurv_hazard_tbl <- extract_stansurv_baseline_hazard(
+      stansurv_fit,
+      summary = FALSE,
+      n = n
+    )
+    
+    # Compute cumulative hazard for each draw
+    stansurv_cumhaz <- stansurv_hazard_tbl |>
+      arrange(draw_id, time) |>
+      group_by(draw_id) |>
+      mutate(
+        time_diff = time - lag(time, default = 0),
+        cumulative_hazard = cumsum(baseline_hazard * time_diff)
+      ) |>
+      ungroup() |>
+      filter(time <= max_time)
+    
+    if (plot_type == "survival") {
+      # Convert to survival probabilities: S(t) = exp(-H(t))
+      stansurv_summary <- stansurv_cumhaz |>
+        mutate(survival_prob = exp(-cumulative_hazard)) |>
+        group_by(time) |>
+        summarise(
+          median_value = median(survival_prob),
+          lower_ci = quantile(survival_prob, (1 - prob) / 2),
+          upper_ci = quantile(survival_prob, (1 + prob) / 2),
+          .groups = "drop"
+        )
+      
+      y_label <- "Baseline Survival Probability"
+      method_label <- "Survival Curve"
+      
+    } else {
+      # Cumulative hazard
+      stansurv_summary <- stansurv_cumhaz |>
+        group_by(time) |>
+        summarise(
+          median_value = median(cumulative_hazard),
+          lower_ci = quantile(cumulative_hazard, (1 - prob) / 2),
+          upper_ci = quantile(cumulative_hazard, (1 + prob) / 2),
+          .groups = "drop"
+        )
+      
+      y_label <- "Cumulative Baseline Hazard"
+      method_label <- "Cumulative Hazard"
+    }
+    
+  } else {
+    # Instantaneous hazard
+    stansurv_summary <- extract_stansurv_baseline_hazard(
+      stansurv_fit,
+      summary = TRUE,
+      n = n
+    ) |>
+      filter(time <= max_time) |>
+      rename(
+        median_value = median_hazard,
+        lower_ci = lower_ci,
+        upper_ci = upper_ci
+      ) |>
+      select(time, median_value, lower_ci, upper_ci)
+    
+    y_label <- "Baseline Hazard Rate"
+    method_label <- "Hazard"
+  }
+  
+  # Extract baseline hazard from coxph
+  coxph_basehaz_tbl <- survival::basehaz(coxph_fit, centered = FALSE) |>
+    as_tibble() |>
+    rename(time = time, cumhaz = hazard) |>
+    filter(time <= max_time)
+  
+  if (plot_type == "survival") {
+    # Convert cumulative hazard to survival: S(t) = exp(-H(t))
+    coxph_values <- coxph_basehaz_tbl |>
+      mutate(survival_prob = exp(-cumhaz)) |>
+      select(time, coxph_value = survival_prob)
+      
+  } else if (plot_type == "cumulative_hazard") {
+    # Use cumulative hazard directly
+    coxph_values <- coxph_basehaz_tbl |>
+      select(time, coxph_value = cumhaz)
+      
+  } else {
+    # Convert to instantaneous hazard
+    coxph_values <- coxph_basehaz_tbl |>
+      arrange(time) |>
+      mutate(
+        baseline_hazard = cumhaz - lag(cumhaz, default = 0),
+        baseline_hazard = baseline_hazard / (time - lag(time, default = 0))
+      ) |>
+      select(time, coxph_value = baseline_hazard)
+  }
+  
+  # Interpolate coxph to stan_surv time points
+  coxph_interp <- tibble(
+    time = stansurv_summary$time,
+    coxph_value = approx(
+      coxph_values$time,
+      coxph_values$coxph_value,
+      xout = stansurv_summary$time,
+      rule = 2
+    )$y
+  )
+  
+  # Combine for comparison
+  comparison_data <- stansurv_summary |>
+    left_join(coxph_interp, by = "time") |>
+    rename(
+      stansurv_median = median_value,
+      stansurv_lower = lower_ci,
+      stansurv_upper = upper_ci,
+      coxph_value = coxph_value
+    )
+  
+  # Create plot
+  time_label <- if (is.finite(max_time)) {
+    glue::glue(" (First {max_time} weeks)")
+  } else {
+    ""
+  }
+  
+  comparison_plot <- ggplot(comparison_data) +
+    geom_ribbon(
+      aes(x = time, ymin = stansurv_lower, ymax = stansurv_upper),
+      alpha = 0.3,
+      fill = "steelblue"
+    ) +
+    geom_line(
+      aes(x = time, y = stansurv_median, color = "stan_surv (median)"),
+      linewidth = 1
+    ) +
+    geom_line(
+      aes(x = time, y = coxph_value, color = "coxph (Breslow)"),
+      linewidth = 1,
+      linetype = "dashed"
+    ) +
+    scale_color_manual(
+      values = c("stan_surv (median)" = "steelblue", "coxph (Breslow)" = "darkorange"),
+      name = "Method"
+    ) +
+    labs(
+      title = glue::glue("Baseline {method_label} Comparison{time_label}"),
+      x = "Time (weeks)",
+      y = y_label,
+      caption = glue::glue("Shaded area shows {prob * 100}% credible interval for stan_surv")
+    ) +
+    theme_minimal()
+  
+  # Return both plot and data
+  list(
+    plot = comparison_plot,
+    data = comparison_data
+  )
+}
+
+
 #' Extract Posterior Survival Probabilities from rstanarm Model
 #'
 #' Reshapes posterior survival probability matrix from rstanarm::posterior_survfit()
