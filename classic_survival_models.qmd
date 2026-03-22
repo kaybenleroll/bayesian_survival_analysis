@@ -76,7 +76,7 @@ plan(multisession)
 
 # Load Policy Data
 
-We first need to load the policy data so we might visualise some of this data.
+Before beginning our survival analysis, we must first load the processed policy data into our environment. This dataset contains information on policy lifetimes, whether a lapse event occurred, and various policyholder characteristics such as gender and smoking status. Loading this data enables us to perform exploratory data analysis, visualize survival curves, and ultimately fit our statistical models.
 
 ```{r load_insample_policy_data}
 #| echo: true
@@ -95,10 +95,11 @@ model_training_tbl |> glimpse()
 
 ## Kaplan-Meier Estimates
 
-### Unsplit
+The Kaplan-Meier estimator is a foundational non-parametric statistic used to estimate the survival function from lifetime data. It provides a visual representation of the probability of survival past a certain time point. A core challenge in survival analysis is **right-censoring**. If a policy is still active (in-force) at the end of our observation period, we know it survived *at least* that long, but we don't know its ultimate lapse time. We cannot simply drop these policies, nor can we treat them as lapses. The Kaplan-Meier estimator gracefully handles this by calculating the conditional probability of surviving each specific time interval, adjusting the 'at-risk' pool to remove censored observations without treating them as events.
 
-We start with some Kaplan-Meier estimates for the whole dataset, with no splits
-in our data.
+### Unsplit Data
+
+We begin by calculating the Kaplan-Meier survival estimates for the entire dataset without segmenting by any covariates. This overall survival curve gives us a baseline understanding of policy retention over time across the entire portfolio.
 
 ```{r calculate_basic_km_estimates}
 #| echo: true
@@ -115,7 +116,7 @@ ggsurvfit(lapse1_km) +
   add_risktable()
 ```
 
-We now want to see the overall estimates for the 1, 2 and 5-year rates.
+To quantify the visual results from the survival curve, it is useful to extract specific point estimates. Here, we calculate the estimated survival probabilities (the proportion of policies that have not lapsed) at key milestones: 1 year, 2 years, and 5 years (converted to weeks, assuming 52 weeks per year). These milestones are commonly used in the insurance industry to track early-duration persistency.
 
 ```{r summary_lapse1}
 #| echo: true
@@ -125,10 +126,9 @@ lapse1_km |>
 ```
 
 
-### Split by Gender
+### Stratification by Gender
 
-We then split our data by the value on `gender_life` and construct KM estimates
-on that.
+Survival patterns often vary significantly across different demographic groups. To investigate this, we stratify our Kaplan-Meier estimates by the `gender_life1` variable. By plotting a separate survival curve for each gender category, we can visually assess whether gender has a meaningful impact on the likelihood of a policy lapsing. We also perform a **log-rank test** (`survdiff`) to statistically evaluate whether the survival distributions between these groups are significantly different. The log-rank test operates by comparing the *observed* number of lapses in a group (e.g., Females) to the *expected* number of lapses if both groups had the exact same underlying survival curve. If we see consistently more lapses in one group at each time point than expected by random chance, the test yields a low p-value, confirming the visual gap between the curves is statistically significant.
 
 ```{r calculate_km_estimates_gender}
 #| echo: true
@@ -152,7 +152,7 @@ ggsurvfit(lapse2_km) +
   add_risktable()
 ```
 
-We also want to estimate the 1, 2 and 5 years lapse.
+As we did for the overall portfolio, we extract the point estimates for survival at the 1, 2, and 5-year marks, but this time broken down by gender. This allows us to quantify the exact differences in persistency between the groups at these specific durations.
 
 ```{r summary_lapse2}
 #| echo: true
@@ -163,9 +163,9 @@ lapse2_km |>
 
 
 
-### Split by Smoker
+### Stratification by Smoking Status
 
-Finally, we look at splitting by `smoker_life1`
+Another critical underwriting factor is smoking status. We now stratify our data by the `smoker_life1` variable to see if smokers and non-smokers exhibit different lapse behaviors. A log-rank test is again used to formally test the null hypothesis that there is no difference in survival between the two groups.
 
 ```{r calculate_km_estimates_smoker}
 #| echo: true
@@ -190,7 +190,7 @@ ggsurvfit(lapse3_km) +
 ```
 
 
-We want to estimate the 1, 2 and 5 years lapse.
+Following our established pattern, we evaluate the 1, 2, and 5-year survival estimates specifically for the different smoking status groups to provide clear, actionable persistency metrics.
 
 ```{r summary_lapse3}
 #| echo: true
@@ -200,7 +200,9 @@ lapse3_km |>
 ```
 
 
-## Use Alternative Descriptive Statistics
+## Summary Statistics and Data Characteristics
+
+While survival curves are insightful, it is also essential to look at traditional descriptive statistics to understand the composition of our dataset. We use the `gtsummary` package to generate a clean, comprehensive table summarizing continuous variables (like `policy_lifetime`) and categorical variables (like `smoker_life1` and `cluster_id`), stratified by gender. This helps ensure our subsequent modeling is grounded in a solid understanding of the underlying data distributions.
 
 
 
@@ -222,15 +224,14 @@ model_training_tbl |>
 
 
 
-# Fit First Cox-PH Models for Lapses
+# Fit First Cox Proportional Hazards Models for Lapses
 
-We now want to fit our Cox Proportional Hazards models to this data.
+The Cox Proportional Hazards (Cox-PH) model is a highly popular semi-parametric regression model used in survival analysis. Unlike the Kaplan-Meier estimator, which only allows us to look at one or two categorical variables at a time, the Cox-PH model enables us to assess the simultaneous effect of multiple covariates (both categorical and continuous) on survival time. It estimates a "hazard ratio" for each predictor, which tells us how the risk of the event (in our case, a lapse) changes with a unit increase in that predictor, assuming the baseline hazard rate remains unspecified. While the survival function $S(t)$ measures the probability of surviving *up to* time $t$, the **hazard function** $h(t)$ measures the instantaneous rate of lapsing *at* time $t$, given the policy has survived that long. The Cox model estimates **Hazard Ratios (HR)** for each predictor, which tells us how the risk of the event changes with a unit increase in that predictor. For example, if the HR for `smoker_life1` is 1.50, it means that at any given moment, a smoker is 50% more likely to lapse their policy than a non-smoker, holding all other variables constant.
 
 
-## First Model
+## Baseline Model
 
-We start with a simple model using both `gender_life1` and `smoker_life1` as
-input variables, and we look to add more as things progress.
+We start by fitting a baseline Cox-PH model using only `gender_life1` and `smoker_life1` as explanatory variables. This simple model gives us an initial look at how these fundamental risk factors influence the hazard rate of policy lapse before we introduce more complex features.
 
 
 ```{r fit_coxph1_model}
@@ -246,7 +247,7 @@ lapse1_coxph <- coxph(
 lapse1_coxph |> summary()
 ```
 
-We now want to calculate the concordance of the first Cox-PH model.
+To evaluate the predictive accuracy of our Cox-PH model, we calculate the concordance index (C-index). The C-index represents the probability that, for any randomly selected pair of policies where one lapsed before the other, the model correctly predicted a higher hazard for the policy that lapsed earlier. A value of 0.5 indicates random guessing, while a value of 1.0 indicates perfect prediction.
 
 ```{r glance_coxph1_model}
 #| echo: true
@@ -256,14 +257,17 @@ lapse1_coxph |>
   select(n, nevent, r.squared, concordance, std.error.concordance)
 ```
 
+**Analysis of Baseline Results:**
+The results from our baseline model show that the concordance index is remarkably low at roughly 0.51, meaning the model is barely better than a coin flip at ranking survival times based solely on smoking and gender. Examining the hazard ratios, "Quitters" (`smoker_life1Q`) have a 13.4% higher hazard of lapsing compared to non-smokers ($p < 0.001$). Curiously, "Smokers" (`smoker_life1S`) are not statistically distinguishable from non-smokers ($p = 0.12$). Lastly, male policyholders show an 8% higher risk of lapsing than females ($HR \approx 1.08$, $p = 0.005$).
 
-## Model Diagnostics for Cox-PH Model
 
-### Test Proportional Hazards Assumption
+## Diagnostics for the Baseline Cox-PH Model
 
-The Cox-PH model assumes that hazards are proportional over time. We test this
-assumption using the Schoenfeld residuals test. A significant p-value indicates
-violation of the proportional hazards assumption.
+A critical step in survival modeling is validating the underlying assumptions of the model.
+
+### Testing the Proportional Hazards Assumption
+
+The fundamental assumption of the Cox-PH model is that the hazard ratios between different groups remain constant over time (the **proportional hazards assumption**). If smokers are 1.5 times more likely to lapse in Year 1, they must also be 1.5 times more likely to lapse in Year 10. If smokers exhibit severe "buyer's remorse" and lapse heavily in the first 6 months, but the remaining smokers are fiercely loyal and rarely lapse thereafter, this assumption is violated. We test this assumption statistically using the **Schoenfeld residuals test** (`cox.zph`). The null hypothesis is that the hazards are proportional; thus, a statistically significant p-value (typically < 0.05) indicates a violation of this assumption for a given covariate.
 
 ```{r test_ph_assumption_coxph1}
 #| echo: true
@@ -273,8 +277,7 @@ lapse1_zph <- cox.zph(lapse1_coxph)
 print(lapse1_zph)
 ```
 
-We can visualize the scaled Schoenfeld residuals over time to assess whether
-the proportional hazards assumption holds for each covariate.
+In addition to the formal statistical test, it is highly recommended to visually inspect the scaled Schoenfeld residuals plotted against time. A smooth spline fit to these residuals should ideally be a horizontal line centered at zero. Any systematic departure from a horizontal line (e.g., a clear upward or downward trend) suggests that the effect of the covariate changes over time, indicating a violation of the proportional hazards assumption.
 
 ```{r plot_schoenfeld_residuals}
 #| echo: true
@@ -282,11 +285,13 @@ the proportional hazards assumption holds for each covariate.
 lapse1_zph |> ggcoxzph(resid = FALSE)
 ```
 
+**Analysis of Proportional Hazards:**
+The Schoenfeld residuals test outputs highly significant p-values for both `smoker_life1` and `gender_life1` (as well as the global test), meaning the proportional hazards assumption is strongly violated. Visually, the plots confirm that the effect of these covariates does not remain perfectly constant over time, suggesting that the underlying hazard ratios fluctuate depending on policy duration. This violation suggests we may need more robust modeling techniques, such as time-varying coefficients, to properly capture the lapse behavior.
 
-### Visualize Hazard Ratios
 
-We create a forest plot to visualize the hazard ratios and their confidence
-intervals for the covariates in our model.
+### Visualizing Hazard Ratios
+
+Forest plots are an excellent way to visually communicate the results of a Cox-PH model. They display the point estimate of the hazard ratio for each covariate along with its 95% confidence interval. A hazard ratio greater than 1 indicates an increased risk of lapse, while a ratio less than 1 indicates a decreased risk. If the confidence interval crosses the vertical line at 1.0, the effect is not considered statistically significant at the 5% level.
 
 ```{r plot_hazard_ratios}
 #| echo: true
@@ -296,15 +301,13 @@ ggforest(lapse1_coxph, data = as.data.frame(model_training_tbl))
 ```
 
 
-### Residual Diagnostics
+### Evaluating Residuals
 
-We examine various types of residuals to assess model fit and identify
-influential observations.
+To further assess model fit and identify potential anomalies in our data, we examine several different types of residuals.
 
 #### Martingale Residuals
 
-Martingale residuals help identify the functional form of covariates and detect
-outliers. Values should be randomly distributed around zero.
+Martingale residuals represent the difference between the observed number of events (lapses) for an individual and the expected number of events based on the fitted model. They are primarily used to assess the functional form of continuous covariates—if the relationship is truly linear, a plot of these residuals against the covariate should show no clear pattern. They take values between negative infinity and 1, and should ideally be randomly distributed around zero.
 
 ```{r plot_martingale_residuals}
 #| echo: true
@@ -323,8 +326,7 @@ ggcoxdiagnostics(
 
 #### Deviance Residuals
 
-Deviance residuals are normalized transformations of martingale residuals and
-should be symmetrically distributed around zero with no patterns.
+Because Martingale residuals are heavily skewed, Deviance residuals are often preferred for identifying outliers. They are a normalized transformation of Martingale residuals designed to be more symmetrically distributed around zero, much like standard residuals in linear regression. Values that fall far from zero (typically beyond +/- 3) may indicate poorly fitted outliers that warrant further investigation. For instance, a highly negative deviance residual (e.g., < -3) represents a policy we predicted would lapse very quickly due to high-risk traits, but which miraculously stayed in-force for 20 years.
 
 ```{r plot_deviance_residuals}
 #| echo: true
@@ -343,8 +345,7 @@ ggcoxdiagnostics(
 
 #### Dfbeta Residuals
 
-Dfbeta residuals measure the influence of each observation on the coefficient
-estimates. Large values indicate influential observations.
+Dfbeta residuals (often referred to as Dfbetas) are used to measure the influence of individual observations on the model's estimated coefficients. Specifically, a Dfbeta value for a given observation and covariate represents the scaled change in the coefficient if that observation were removed from the dataset. Unusually large Dfbeta values suggest that the corresponding observation is exerting disproportionate leverage on the model's results. An observation with a massive Dfbeta might be a radical outlier in the covariate space—for instance, a massive $20M `sum_assured` policy in a dataset mostly containing $100k policies. Because of its leverage, this single policy might be pulling the entire `sum_assured` hazard ratio upward.
 
 ```{r plot_dfbeta_residuals}
 #| echo: true
@@ -361,9 +362,9 @@ ggcoxdiagnostics(
 ```
 
 
-### Influential Observations
+### Identifying Influential Observations
 
-We identify potentially influential observations using dfbetas values.
+Building on the Dfbeta plots, we can programmatically flag observations that exceed a common heuristic threshold for influence (2 / sqrt(n), where n is the number of observations). Identifying these highly influential data points is crucial, as they might represent data entry errors or unique edge cases that significantly alter our hazard ratio estimates.
 
 ```{r identify_influential_observations}
 #| echo: true
@@ -385,8 +386,7 @@ write_lines(glue(
 
 # Extended Cox-PH Model
 
-We now fit an extended model including additional covariates to improve model
-performance.
+Having thoroughly evaluated our baseline model, we now expand it by incorporating additional covariates: `cluster_id` and `sum_assured`. Including these variables aims to control for potential confounding effects and improve the overall predictive power of the model. By observing how the coefficients for gender and smoking status change when these new variables are introduced, we can gain a deeper understanding of the true drivers of policy lapse.
 
 ```{r fit_coxph2_model}
 #| echo: true
@@ -401,13 +401,13 @@ lapse2_coxph <- coxph(
 lapse2_coxph |> summary()
 ```
 
+**Analysis of the Extended Model:**
+Adding `cluster_id` and `sum_assured` reveals a highly significant geographic effect: `cluster_idn6_c5` carries a roughly 36% higher risk of lapsing compared to the baseline cluster ($HR \approx 1.36$, $p < 0.001$). Interestingly, `sum_assured` is not statistically significant ($p \approx 0.19$), implying that the face value of the policy alone does not meaningfully alter the lapse risk when controlling for demographics and clusters. The baseline effects (gender and smoking status) remain largely stable despite the new covariates.
 
 
+## Diagnostics for the Extended Model
 
-
-## Diagnostics for Extended Model
-
-Test proportional hazards assumption for the extended model.
+Just as with the baseline model, we must verify the proportional hazards assumption for the newly added covariates. We run the Schoenfeld residuals test again for this extended model.
 
 ```{r test_ph_assumption_lapse2}
 #| echo: true
@@ -417,8 +417,7 @@ lapse2_zph <- cox.zph(lapse2_coxph)
 print(lapse2_zph)
 ```
 
-We can visualize the scaled Schoenfeld residuals over time to assess whether
-the proportional hazards assumption holds for each covariate.
+We plot the Schoenfeld residuals for the extended model to visually check for any time-varying effects among the expanded set of predictors.
 
 ```{r plot_schoenfeld_residuals_lapse2}
 #| echo: true
@@ -428,7 +427,9 @@ lapse2_zph |> ggcoxzph(resid = FALSE)
 
 
 
-## Hazard Ratios for Extended Model
+## Hazard Ratios for the Extended Model
+
+We present the updated hazard ratios in a new forest plot. This allows us to quickly assess the impact and statistical significance of `sum_assured` and `cluster_id`, as well as observe any shifts in the baseline predictors.
 
 ```{r plot_hazard_ratios_model2}
 #| echo: true
@@ -439,8 +440,7 @@ ggforest(lapse2_coxph, data = as.data.frame(model_training_tbl))
 
 ## Predicted Survival Curves
 
-We can generate predicted survival curves for different covariate profiles to
-understand how the model predicts survival for different groups.
+One of the most practical applications of a fitted Cox-PH model is predicting survival probabilities for specific hypothetical policyholders. By constructing a synthetic dataset containing various combinations of covariate profiles (e.g., combinations of smoking status, gender, and quantiles of sum assured), we can use the `survfit` function on our extended model object to generate customized predicted survival curves.
 
 ```{r create_prediction_profiles}
 #| echo: true
@@ -493,8 +493,7 @@ ggsurvplot(
 
 ## Cumulative Hazard Function
 
-We examine the cumulative hazard function to understand the risk accumulation
-over time.
+Alternatively, we can visualize the cumulative hazard function, which represents the accumulated risk of lapsing up to a given time. Unlike the survival function, which drops from 1 to 0, the cumulative hazard function increases from 0 upwards. This perspective is particularly useful for identifying periods where risk accelerates rapidly. The cumulative hazard $H(t)$ is mathematically linked to survival via $S(t) = exp(-H(t))$. While survival probabilities multiply, cumulative hazards simply add up. If $H(5\ years) = 0.69$, it means that if a policy could hypothetically lapse multiple times (like a machine requiring repairs), we would expect an average of 0.69 lapses per policy by year 5. Visually, steep upward slopes in this chart cleanly highlight periods of accelerating risk (e.g., a sudden spike in lapses at the 10-year premium renewal date).
 
 ```{r plot_cumulative_hazard}
 #| echo: true
@@ -515,7 +514,7 @@ ggsurvplot(
 
 ## Model Comparison
 
-We compare the two models using likelihood ratio test and AIC.
+Finally, we need to formally evaluate whether adding the extra covariates in the extended model provided a statistically meaningful improvement over the baseline model. We use the Likelihood Ratio Test (LRT) to compare the nested models, and we examine information criteria like the Akaike Information Criterion (AIC) and Bayesian Information Criterion (BIC). Lower AIC/BIC values and a significant LRT p-value suggest that the more complex extended model offers a superior fit to the data, balancing the improvement in likelihood against the penalty for adding more parameters. Adding more variables to a model will almost always improve its fit to the training data, but it risks overfitting. The AIC balances this by penalizing the model for each additional parameter. A rule of thumb is that an AIC drop of > 2 indicates a meaningful improvement. The LRT formally tests whether the reduction in deviance achieved by adding `cluster_id` and `sum_assured` is statistically significant given the extra degrees of freedom.
 
 ```{r compare_models}
 #| echo: true
@@ -545,9 +544,5 @@ model_comparison_tbl <- bind_rows(
 print(model_comparison_tbl)
 ```
 
-
-
-
-
-
-
+**Analysis of Model Comparison:**
+The Likelihood Ratio Test demonstrates that the reduction in deviance is highly statistically significant ($p < 0.001$). Furthermore, the AIC drops by over 140 points (from roughly 109917 to 109774), confirming that the inclusion of the geographic clusters improves the model's fit substantially despite the penalty for extra parameters. The concordance index also increases from 0.51 to nearly 0.55, which is a measurable improvement, although it indicates that our models are still missing critical predictive features needed to accurately forecast individual policy lapses.
