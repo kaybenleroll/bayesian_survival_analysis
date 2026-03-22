@@ -1,0 +1,64 @@
+# Example: Use a minimal R Docker image as a job container
+name: Run R Analysis (Job Container)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-r-script-container:
+    runs-on: ubuntu-latest
+    container:
+      image: rocker/tidyverse:4.5.1  # Pre-installed tidyverse and R
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y libcurl4-openssl-dev libssl-dev libxml2-dev
+
+      # Install only specific R packages you need
+      - name: Install required R packages
+        run: |
+          echo "Installing only required R packages..."
+          Rscript -e "
+          # Install only the packages your script actually needs
+          # Replace these with your actual requirements:
+          
+          required_packages <- c(
+            'here',      # for file paths
+            'cowplot'    # for enhanced plotting
+          )
+          
+          # Install packages if not already installed
+          new_packages <- required_packages[!(required_packages %in% installed.packages()[,'Package'])]
+          if(length(new_packages)) {
+            cat('Installing packages:', paste(new_packages, collapse = ', '), '\n')
+            install.packages(new_packages, dependencies = FALSE)
+          } else {
+            cat('All required packages already installed\n')
+          }
+          
+          # Verify installation
+          cat('Installed packages:\n')
+          for(pkg in required_packages) {
+            if(require(pkg, character.only = TRUE, quietly = TRUE)) {
+              cat('✓', pkg, '\n')
+            } else {
+              cat('✗', pkg, 'FAILED\n')
+            }
+          }
+          "
+        shell: bash
+
+      - name: Install R dependencies
+        run: |
+          Rscript -e "install.packages(c('here', 'dotenv'))"
+
+      - name: Execute R script from portal directory
+#        working-directory: portal
+        run: |
+          echo "Running R script from portal/..."
+#          Rscript scripts/run_code.R

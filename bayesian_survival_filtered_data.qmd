@@ -1,0 +1,1756 @@
+---
+title: "Bayesian Survival Models for Life Insurance Lapses (Filtered Dataset)"
+author: "Mick Cooney <mickcooney@gmail.com>"
+date: "Last updated: `r format(Sys.time(), '%B %d, %Y')`"
+editor: source
+execute:
+  error: false
+  message: false
+  echo: true
+  daemon: false
+format:
+  html:
+    light: superhero
+    dark: darkly
+    anchor-sections: true
+    embed-resources: true
+    number-sections: true
+    smooth-scroll: true
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+---
+
+
+```{r import_libraries}
+#| echo: false
+#| message: false
+
+library(conflicted)
+library(tidyverse)
+library(scales)
+library(cowplot)
+library(magrittr)
+library(rlang)
+library(arrow)
+library(fs)
+library(qs)
+library(purrr)
+library(furrr)
+library(glue)
+library(scales)
+library(cmdstanr)
+library(brms)
+library(posterior)
+library(bayesplot)
+library(tidybayes)
+library(splines2)
+library(rstanarm)
+
+
+source("lib_utils.R")
+source("lib_brms_hazard.R")
+source("lib_survival_modelling.R")
+source("lib_cashflow_projection.R")
+source("lib_stan_diagnostics.R")
+
+
+conflict_lst <- resolve_conflicts(
+  c("magrittr", "rlang", "dplyr", "readr", "purrr", "ggplot2", "MASS",
+    "fitdistrplus")
+  )
+
+
+options(
+  width = 80L,
+  warn  = 1,
+  mc.cores = parallelly::availableCores()
+  )
+
+# Configure Arrow for multi-threaded parquet I/O
+set_cpu_count(parallelly::availableCores())
+set_io_thread_count(parallelly::availableCores())
+
+message(glue(
+  "Arrow configured: {arrow::cpu_count()} CPU threads, ",
+  "{io_thread_count()} I/O threads"
+))
+
+message("write_parquet_compressed() loaded from lib_utils.R (zstd level 3 default)")
+
+stan_modeldir <- "stan_model"
+stan_codedir  <- "stan_code"
+data_dir      <- "data"
+
+
+set.seed(42)
+stanfit_seed <- 4000
+
+theme_set(theme_cowplot())
+
+plan(multisession)
+```
+
+
+```{r setup_chunk_timing}
+#| echo: false
+#| message: false
+
+# Enable chunk timing for all chunks
+knitr::opts_chunk$set(time_it = TRUE)
+
+# Create a list to store chunk times
+chunk_times <- list()
+
+# Create a hook to capture chunk execution times
+knitr::knit_hooks$set(time_it = function(before, options) {
+  if (before) {
+    # Record start time in global environment
+    assign(".chunk_start_time", Sys.time(), envir = .GlobalEnv)
+  } else {
+    # Calculate elapsed time
+    elapsed <- difftime(
+        Sys.time(), get(".chunk_start_time", envir = .GlobalEnv),
+        units = "secs"
+        ) |>
+      as.numeric()
+    
+    # Store in global list
+    chunk_times <- get("chunk_times", envir = .GlobalEnv)
+    chunk_times[[options$label]] <- elapsed
+    assign("chunk_times", chunk_times, envir = .GlobalEnv)
+    
+    # Print timing message
+    message(glue("⏱️  Chunk '{options$label}': {round(elapsed, 2)} seconds"))
+  }
+})
+```
+
+
+
+# Load Data
+
+This notebook uses a **filtered** dataset that focuses on more recent policies
+with lower premiums. The data has been pre-filtered to include only:
+
+- Policies with `prem_ape < 15,000` (lower annual premiums)
+- Policies starting from `2005-01-01` onwards (recent inception dates)
+
+This filtering helps us focus on a more homogeneous subset of the portfolio,
+potentially improving model performance and interpretability. We use the **small**
+version of the filtered dataset for faster iteration and development.
+
+We first load up the filtered data we are using to train our model, as well as
+the 'rolled-forward' data that observes the same policies a year later.
+
+```{r load_modelling_data}
+#| echo: true
+
+model_training_tbl <- glue("{data_dir}/model_training_filtered_small_tbl.parquet") |>
+  read_parquet()
+
+model_training_tbl |> glimpse()
+```
+
+We then load up the 'current' data that we use to validate our model.
+
+
+```{r load_current_data}
+#| echo: true
+
+model_rollforward_tbl <- glue("{data_dir}/model_rollforward_filtered_small_tbl.parquet") |>
+  read_parquet()
+
+model_rollforward_tbl |> glimpse()
+```
+
+
+## Create Shared Data Objects
+
+These objects are used across all three model iterations and are created once
+here to avoid duplication.
+
+```{r create_monthly_dates}
+#| echo: true
+
+monthly_tbl <- tibble(
+  date = seq(as.Date("2015-01-01"), as.Date("2016-02-01"), by = "month"),
+  weeks = difftime(date, as.Date("2015-01-01"), units = "weeks") |> as.numeric()
+  )
+
+monthly_tbl |> glimpse()
+```
+
+
+```{r create_inforce_subset}
+#| echo: true
+
+inforce_tbl <- model_training_tbl |>
+  filter(
+    status_at_reference_date == "inforce",
+    policy_startdate         >= as.Date("2010-01-01")
+    )
+
+message(glue("Inforce policies: {nrow(inforce_tbl)}"))
+```
+
+
+```{r create_policy_cutdown}
+#| echo: true
+
+policy_cutdown_tbl <- model_training_tbl |>
+  select(policy_id, policy_startdate, policy_enddate, prem_ape)
+
+policy_cutdown_tbl |> glimpse()
+```
+
+
+```{r extract_cashflow_week_count}
+#| echo: true
+
+cashflow_week_count <- monthly_tbl |> pull(weeks)
+
+message(glue("Number of cashflow periods: {length(cashflow_week_count)}"))
+```
+
+
+```{r calculate_actual_cashflows}
+#| echo: true
+
+actual_cashflows_tbl <- model_rollforward_tbl |>
+  semi_join(inforce_tbl, by = "policy_id") |>
+  calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date)
+
+actual_cashflows_tbl |> glimpse()
+```
+
+
+```{r summarise_actual_cashflows}
+#| echo: true
+
+actual_monthly_tbl <- actual_cashflows_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+actual_monthly_tbl |> glimpse()
+```
+
+
+```{r calculate_actual_cashflows_recent}
+#| echo: true
+
+actual_cashflows_recent_tbl <- model_rollforward_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  semi_join(inforce_tbl, by = "policy_id") |>
+  calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date)
+
+actual_cashflows_recent_tbl |> glimpse()
+```
+
+
+```{r summarise_actual_cashflows_recent}
+#| echo: true
+
+actual_monthly_recent_tbl <- actual_cashflows_recent_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+actual_monthly_recent_tbl |> glimpse()
+```
+
+Finally, we save some of this data to disk so it can be used again.
+
+```{r save_actual_data}
+#| echo: false
+
+actual_cashflow_file <- glue("{data_dir}/filtered_actual_cashflow_tbl.parquet")
+
+actual_cashflows_tbl |> write_parquet_compressed(actual_cashflow_file)
+```
+
+
+
+
+# Build Initial Cox Model
+
+
+## brms Model
+
+```{r filterlapse1_fit_cox_model_brms}
+#| echo: true
+#| message: false
+
+filterlapse1_stanmodel_name <- "filterlapse1_coxph_brms"
+
+filterlapse1_coxph_brmsfit <- brm(
+  policy_lifetime | cens(1-lapsed) ~ gender_life1 + smoker_life1,
+  data            = model_training_tbl,
+  family          = cox(link = "log"),
+  cores           = 4,
+  seed            = 421,
+  save_warmup     = FALSE,
+  backend         = "cmdstanr",
+  save_model      = glue("{stan_codedir}/{filterlapse1_stanmodel_name}.stan"),
+  file            = glue("{stan_modeldir}/{filterlapse1_stanmodel_name}_brmsfit"),
+  output_dir      = stan_modeldir,
+  output_basename = filterlapse1_stanmodel_name,
+
+  stan_model_args = list(
+    include_paths   =     "stan_code",
+    pedantic        =            TRUE,
+    dir             =    "stan_model"
+    )
+  )
+```
+
+```{r filterlapse1_fit_cox_model_brms_summary}
+#| echo: true
+
+summary(filterlapse1_coxph_brmsfit)
+```
+
+
+
+## rstanarm Model
+
+
+```{r filterlapse1_fit_cox_model_rstanarm}
+#| echo: true
+#| message: false
+
+filterlapse1_stanmodel_name <- "filterlapse1_coxph_stansurv"
+filterlapse1_stanmodel_file <- glue("{stan_modeldir}/{filterlapse1_stanmodel_name}.qs")
+
+# Check if fitted model exists, load it if so, otherwise fit new model
+if (file_exists(filterlapse1_stanmodel_file)) {
+  message(glue("Loading cached model from {filterlapse1_stanmodel_file}"))
+  filterlapse1_coxph_stansurv <- qread(filterlapse1_stanmodel_file)
+
+} else {
+  message(glue("Fitting new model, will save to {filterlapse1_stanmodel_file}"))
+  
+  # Flush output to ensure visibility in Podman
+  cat("Starting Stan model fitting...\n")
+  flush.console()
+  
+  filterlapse1_coxph_stansurv <- stan_surv(
+    Surv(policy_lifetime, lapsed) ~ gender_life1 + smoker_life1,
+    data   = model_training_tbl,
+    
+    # MCMC sampling parameters
+    chains = 4,
+    iter   = 2000,
+    warmup = 1000,
+    seed   = 4000,
+    cores  = 4,
+    
+    # Baseline hazard specification
+    basehaz     = "ms",  # M-splines (flexible, default)
+    basehaz_ops = list(df = 6),  # Degrees of freedom for baseline hazard
+    
+    # Prior specifications (explicit is better than implicit)
+    prior           = rstanarm::normal(location = 0, scale = 2.5), # Weakly informative for coefficients
+    prior_intercept = rstanarm::normal(location = 0, scale = 10),  # For baseline hazard
+    
+    # Enable verbose output for console monitoring (not captured in document)
+    refresh = 200  # Print progress every 200 iterations
+    )
+  
+  cat("Model fitting complete.\n")
+  flush.console()
+  
+  # Save fitted model for future use
+  filterlapse1_coxph_stansurv |> qsave(filterlapse1_stanmodel_file, preset = "balanced")
+  message(glue("Model saved to {filterlapse1_stanmodel_file}"))
+}
+```
+
+```{r filterlapse1_fit_cox_model_stansurv_summary}
+#| echo: true
+#| message: true
+
+summary(filterlapse1_coxph_stansurv)
+```
+
+
+## Model Diagnostics
+
+We examine the MCMC diagnostics to ensure the model has converged properly and
+the posterior samples are reliable. Key metrics include:
+
+- **Rhat**: Should be < 1.01 (measures convergence across chains)
+- **ESS ratio**: Should be > 0.1, ideally > 0.5 (effective sample size)
+- **Divergences**: Should be 0 (indicates sampling issues)
+- **Trace plots**: Should show good mixing without trends
+
+```{r filterlapse1_model_diagnostics_convergence}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 5
+
+# Check actual parameter names
+write_lines("Model parameters:", stdout())
+names(coef(filterlapse1_coxph_stansurv)) |> print()
+
+plot_stan_convergence(
+  filterlapse1_coxph_stansurv,
+  title = "Model 1 Convergence Diagnostics: Gender + Smoker"
+  )
+```
+
+
+```{r filterlapse1_model_diagnostics_mixing}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 10
+
+plot_stan_mixing(
+  filterlapse1_coxph_stansurv,
+  title = "Model 1 Chain Mixing: Gender + Smoker"
+  )
+```
+
+
+# Construct Posterior Survival Estimates
+
+We now want to use our fitted model to predict the lapse for the portfolio.
+
+We model the monthly paid premia in the portfolio for the final year for which
+we have data. We can then compare our modelled cashflows against the observed
+data.
+
+
+## Extract Posterior Estimates
+
+
+```{r filterlapse1_construct_posterior_estimates}
+#| echo: true
+
+filterlapse1_post_draws_file <- glue("{stan_modeldir}/filterlapse1_post_draws_lst.qs")
+
+# Check if cached posterior draws exist
+if (file_exists(filterlapse1_post_draws_file)) {
+  message(glue("Loading cached posterior draws from {filterlapse1_post_draws_file}"))
+  filterlapse1_post_draws_lst <- qread(filterlapse1_post_draws_file)
+  
+} else {
+  message(glue("Computing posterior draws, will save to {filterlapse1_post_draws_file}"))
+  
+  filterlapse1_post_draws_lst <- posterior_survfit(
+      filterlapse1_coxph_stansurv,
+      newdata       = inforce_tbl,
+      last_time     = NULL,
+      draws         = 2000,
+      condition     = TRUE,
+      return_matrix = TRUE
+      )
+  
+  # Save for future use
+  filterlapse1_post_draws_lst |> qsave(filterlapse1_post_draws_file, preset = "balanced")
+  message(glue("Posterior draws saved to {filterlapse1_post_draws_file}"))
+}
+
+filterlapse1_post_draws_lst[[1]] |> glimpse()
+```
+
+
+```{r filterlapse1_extract_posterior_survival_estimates}
+#| echo: true
+#| message: false
+
+filterlapse1_post_survival_file <- glue("{stan_modeldir}/filterlapse1_post_survival_tbl.parquet")
+
+# Check if cached posterior survival data exists
+if (file_exists(filterlapse1_post_survival_file)) {
+  message(glue("Loading cached posterior survival data from {filterlapse1_post_survival_file}"))
+  filterlapse1_post_survival_tbl <- read_parquet(filterlapse1_post_survival_file)
+  
+} else {
+  message(glue("Extracting posterior survival data, will save to {filterlapse1_post_survival_file}"))
+  
+  filterlapse1_post_survival_tbl <- filterlapse1_post_draws_lst |>
+    map_dfr(
+      extract_stansurv_posterior_survivals,
+
+      .progress = "extract_post_surv"
+      ) |>
+    filter(time < 5 * 52) |>
+    mutate(
+      policy_id = inforce_tbl$policy_id[idx],
+      
+      .before = 1
+      ) |>
+    select(policy_id, draw_id, time, post_surv_prob = value) |>
+    interpolate_survival_data(
+      new_times = cashflow_week_count
+      ) |>
+    group_nest(policy_id, draw_id)
+  
+  # Save for future use
+  filterlapse1_post_survival_tbl |> write_parquet_compressed(filterlapse1_post_survival_file)
+  message(glue("Posterior survival data saved to {filterlapse1_post_survival_file}"))
+}
+
+filterlapse1_post_survival_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse1_calculate_sim_lapse_times}
+#| echo: true
+#| message: false
+
+filterlapse1_sim_lapse_times_file <- glue("{stan_modeldir}/filterlapse1_sim_lapse_times_tbl.parquet")
+
+# Check if cached simulated lapse times exist
+if (file_exists(filterlapse1_sim_lapse_times_file)) {
+  message(glue("Loading cached simulated lapse times from {filterlapse1_sim_lapse_times_file}"))
+  filterlapse1_sim_lapse_times_tbl <- read_parquet(filterlapse1_sim_lapse_times_file)
+  
+} else {
+  message(glue("Computing simulated lapse times, will save to {filterlapse1_sim_lapse_times_file}"))
+  
+  filterlapse1_sim_lapse_times_tbl <- filterlapse1_post_survival_tbl |>
+    mutate(
+      rnd_draw   = runif(n(), 0, 1),
+      lapse_time = map2_dbl(
+        data, rnd_draw,
+        \(x, y) extract_survival_time(x, y, min_time = 1),
+
+        .progress = "extract_survival_time"
+        )
+      ) |>
+    select(policy_id, draw_id, lapse_time)
+  
+  # Save for future use
+  filterlapse1_sim_lapse_times_tbl |> write_parquet_compressed(filterlapse1_sim_lapse_times_file)
+  message(glue("Simulated lapse times saved to {filterlapse1_sim_lapse_times_file}"))
+}
+
+filterlapse1_sim_lapse_times_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse1_construct_policy_sim_data}
+#| echo: true
+
+filterlapse1_sim_policy_data_tbl <- filterlapse1_sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+
+      # Policy has expired (term ended)
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+
+      # Policy has lapsed and the lapse occurred before or on the reference date
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01")) ~ "lapsed",
+
+      # Policy is within term and either not lapsed or lapsed after reference date
+      as.Date("2016-01-01") <= policy_enddate ~ "inforce",
+
+      # Default case (shouldn't occur with proper data)
+      TRUE ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+
+filterlapse1_sim_policy_data_tbl |> glimpse()
+```
+
+
+## Construct Simulated Cashflow Data
+
+
+```{r filterlapse1_construct_simulated_cashflows}
+#| echo: true
+#| message: false
+
+filterlapse1_sim_cashflow_file <- glue("{stan_modeldir}/filterlapse1_sim_cashflow_tbl.parquet")
+
+# Check if cached simulated cashflow data exists
+if (file_exists(filterlapse1_sim_cashflow_file)) {
+  message(glue("Loading cached simulated cashflows from {filterlapse1_sim_cashflow_file}"))
+  filterlapse1_sim_cashflow_tbl <- read_parquet(filterlapse1_sim_cashflow_file)
+  
+} else {
+  message(glue("Computing simulated cashflows, will save to {filterlapse1_sim_cashflow_file}"))
+  
+  filterlapse1_sim_cashflow_tbl <- filterlapse1_sim_policy_data_tbl |>
+    group_nest(draw_id) |>
+    mutate(
+      newdata = map(
+        data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+                    
+        .progress = "joining_data")
+        ) |>
+    select(-data) |>
+    unnest(newdata)
+  
+  # Save for future use
+  filterlapse1_sim_cashflow_tbl |> write_parquet_compressed(filterlapse1_sim_cashflow_file)
+  message(glue("Simulated cashflows saved to {filterlapse1_sim_cashflow_file}"))
+}
+
+filterlapse1_sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse1_construct_simulated_monthly_cashflows}
+#| echo: true
+
+filterlapse1_sim_monthly_cashflow_tbl <- filterlapse1_sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+filterlapse1_sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse1_construct_comparison_plot}
+#| echo: true
+
+ggplot(filterlapse1_sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse1_stanmodel_name}")
+    )
+```
+
+We create a similar plot using ribbons using quantiles of the simulated
+cashflows.
+
+```{r filterlapse1_construct_comparison_plot_ribbons}
+#| echo: true
+
+filterlapse1_sim_monthly_bands_tbl <- filterlapse1_sim_monthly_cashflow_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse1_sim_monthly_bands_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse1_stanmodel_name}"),
+    subtitle = "Showing 50% and 80% bands"
+    )
+```
+
+
+### Recent Policies Only (2010+)
+
+We now repeat both visualizations, but restrict the data to only policies that
+have a start date from 2010-01-01 onwards, so that we are focusing solely on
+more recently incepted policies.
+
+```{r filterlapse1_filter_recent_policies}
+#| echo: true
+
+# Filter simulated cashflows for recent policies
+filterlapse1_sim_monthly_cashflow_recent_tbl <- filterlapse1_sim_cashflow_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r filterlapse1_construct_comparison_plot_recent}
+#| echo: true
+
+ggplot(filterlapse1_sim_monthly_cashflow_recent_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse1_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01)"
+    )
+```
+
+```{r filterlapse1_construct_comparison_plot_ribbons_recent}
+#| echo: true
+
+filterlapse1_sim_monthly_bands_recent_tbl <- filterlapse1_sim_monthly_cashflow_recent_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse1_sim_monthly_bands_recent_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse1_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01), showing 50% and 80% bands"
+    )
+```
+
+
+We now clean up the environment before building the next model.
+
+```{r filterlapse1_clear_large_objects}
+#| echo: false
+
+# Save tibbles before removing
+filterlapse1_post_survival_tbl |> write_parquet(glue("{stan_modeldir}/filterlapse1_post_survival_tbl.parquet"))
+filterlapse1_sim_cashflow_tbl  |> write_parquet(glue("{stan_modeldir}/filterlapse1_sim_cashflow_tbl.parquet"))
+
+# Remove large objects
+rm(filterlapse1_post_survival_tbl, filterlapse1_post_draws_lst, filterlapse1_sim_cashflow_tbl)
+
+gc(verbose = TRUE)
+```
+
+
+
+
+# Build Expanded Cox Model
+
+We now want to add a number of covariates to the model to see if we can improve
+it.
+
+## rstanarm Model
+
+
+```{r filterlapse2_fit_cox_model_rstanarm}
+#| echo: true
+#| results: hide
+#| message: false
+
+filterlapse2_stanmodel_name <- "filterlapse2_coxph_stansurv"
+filterlapse2_stanmodel_file <- glue("{stan_modeldir}/{filterlapse2_stanmodel_name}.qs")
+
+# Check if fitted model exists, load it if so, otherwise fit new model
+if (file_exists(filterlapse2_stanmodel_file)) {
+  message(glue("Loading cached model from {filterlapse2_stanmodel_file}"))
+  filterlapse2_coxph_stansurv <- qread(filterlapse2_stanmodel_file)
+
+} else {
+  message(glue("Fitting new model, will save to {filterlapse2_stanmodel_file}"))
+
+  # Create stan_model directory if it doesn't exist
+  dir_create(stan_modeldir, recurse = TRUE)
+  
+  filterlapse2_coxph_stansurv <- stan_surv(
+    Surv(policy_lifetime, lapsed) ~ gender_life1 + smoker_life1 + cluster_id + prem_sa_ratio,
+    data   = model_training_tbl,
+    
+    # MCMC sampling parameters
+    chains = 4,
+    iter   = 2000,
+    warmup = 1000,
+    seed   = 4000,
+    cores  = 4,
+    
+    # Baseline hazard specification
+    basehaz     = "ms",  # M-splines (flexible, default)
+    basehaz_ops = list(df = 6),  # Degrees of freedom for baseline hazard
+    
+    # Prior specifications (explicit is better than implicit)
+    prior           = rstanarm::normal(location = 0, scale = 2.5), # Weakly informative for coefficients
+    prior_intercept = rstanarm::normal(location = 0, scale = 10),  # For baseline hazard
+    
+    # Enable verbose output for console monitoring (not captured in document)
+    refresh = 200  # Print progress every 200 iterations
+    )
+  
+  # Save fitted model for future use
+  filterlapse2_coxph_stansurv |> qsave(filterlapse2_stanmodel_file, preset = "balanced")
+  message(glue("Model saved to {filterlapse2_stanmodel_file}"))
+}
+```
+
+```{r filterlapse2_fit_cox_model_stansurv_summary}
+#| echo: true
+#| message: true
+
+summary(filterlapse2_coxph_stansurv)
+```
+
+
+## Model Diagnostics
+
+We examine the MCMC diagnostics for the expanded model that includes cluster
+effects and premium-to-sum-assured ratio.
+
+```{r filterlapse2_model_diagnostics_convergence}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 5
+
+plot_stan_convergence(
+  filterlapse2_coxph_stansurv,
+  title = "Model 2 Convergence Diagnostics: Gender + Smoker + Cluster + Premium Ratio"
+  )
+```
+
+
+```{r filterlapse2_model_diagnostics_mixing}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 10
+
+plot_stan_mixing(
+  filterlapse2_coxph_stansurv,
+  title = "Model 2 Chain Mixing: Gender + Smoker + Cluster + Premium Ratio"
+  )
+```
+
+
+## Construct Posterior Survival Estimates
+
+We now want to use our fitted model to predict the lapse for the portfolio.
+
+We model the monthly paid premia in the portfolio for the final year for which
+we have data. We can then compare our modelled cashflows against the observed
+data.
+
+```{r filterlapse2_construct_rstanarm_posterior_estimates}
+#| echo: true
+
+filterlapse2_post_draws_file <- glue("{stan_modeldir}/filterlapse2_post_draws_lst.qs")
+
+# Check if cached posterior draws exist
+if (file_exists(filterlapse2_post_draws_file)) {
+  message(glue("Loading cached posterior draws from {filterlapse2_post_draws_file}"))
+  filterlapse2_post_draws_lst <- qread(filterlapse2_post_draws_file)
+  
+} else {
+  message(glue("Computing posterior draws, will save to {filterlapse2_post_draws_file}"))
+  
+  filterlapse2_post_draws_lst <- posterior_survfit(
+      filterlapse2_coxph_stansurv,
+      newdata       = inforce_tbl,
+      last_time     = NULL,
+      draws         = 2000,
+      condition     = TRUE,
+      return_matrix = TRUE
+      )
+  
+  # Save for future use
+  filterlapse2_post_draws_lst |> qsave(filterlapse2_post_draws_file, preset = "balanced")
+  message(glue("Posterior draws saved to {filterlapse2_post_draws_file}"))
+}
+
+filterlapse2_post_draws_lst[[1]] |> glimpse()
+```
+
+
+```{r filterlapse2_extract_posterior_survival_estimates}
+#| echo: true
+#| message: false
+
+filterlapse2_cashflow_week_count <- monthly_tbl |> pull(weeks)
+
+filterlapse2_post_survival_file <- glue("{stan_modeldir}/filterlapse2_post_survival_tbl.parquet")
+
+# Check if cached posterior survival data exists
+if (file_exists(filterlapse2_post_survival_file)) {
+  message(glue("Loading cached posterior survival data from {filterlapse2_post_survival_file}"))
+  filterlapse2_post_survival_tbl <- read_parquet(filterlapse2_post_survival_file)
+  
+} else {
+  message(glue("Extracting posterior survival data, will save to {filterlapse2_post_survival_file}"))
+  
+  filterlapse2_post_survival_tbl <- filterlapse2_post_draws_lst |>
+    map_dfr(
+      extract_stansurv_posterior_survivals,
+
+      .progress = "extract_post_surv"
+      ) |>
+    filter(time < 5 * 52) |>
+    mutate(
+      policy_id = inforce_tbl$policy_id[idx],
+      
+      .before = 1
+      ) |>
+    select(policy_id, draw_id, time, post_surv_prob = value) |>
+    interpolate_survival_data(
+      new_times = filterlapse2_cashflow_week_count
+      ) |>
+    group_nest(policy_id, draw_id)
+  
+  # Save for future use
+  filterlapse2_post_survival_tbl |> write_parquet_compressed(filterlapse2_post_survival_file)
+  message(glue("Posterior survival data saved to {filterlapse2_post_survival_file}"))
+}
+
+filterlapse2_post_survival_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse2_calculate_sim_lapse_times}
+#| echo: true
+#| message: false
+
+filterlapse2_sim_lapse_times_file <- glue("{stan_modeldir}/filterlapse2_sim_lapse_times_tbl.parquet")
+
+# Check if cached simulated lapse times exist
+if (file_exists(filterlapse2_sim_lapse_times_file)) {
+  message(glue("Loading cached simulated lapse times from {filterlapse2_sim_lapse_times_file}"))
+  filterlapse2_sim_lapse_times_tbl <- read_parquet(filterlapse2_sim_lapse_times_file)
+  
+} else {
+  message(glue("Computing simulated lapse times, will save to {filterlapse2_sim_lapse_times_file}"))
+  
+  filterlapse2_sim_lapse_times_tbl <- filterlapse2_post_survival_tbl |>
+    mutate(
+      rnd_draw   = runif(n(), 0, 1),
+      lapse_time = map2_dbl(
+        data, rnd_draw,
+        \(x, y) extract_survival_time(x, y, min_time = 1),
+
+        .progress = "extract_survival_time"
+        )
+      ) |>
+    select(policy_id, draw_id, lapse_time)
+  
+  # Save for future use
+  filterlapse2_sim_lapse_times_tbl |> write_parquet_compressed(filterlapse2_sim_lapse_times_file)
+  message(glue("Simulated lapse times saved to {filterlapse2_sim_lapse_times_file}"))
+}
+
+filterlapse2_sim_lapse_times_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse2_construct_policy_sim_data}
+#| echo: true
+
+filterlapse2_sim_policy_data_tbl <- filterlapse2_sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+
+      # Policy has expired (term ended)
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+
+      # Policy has lapsed and the lapse occurred before or on the reference date
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01")) ~ "lapsed",
+
+      # Policy is within term and either not lapsed or lapsed after reference date
+      as.Date("2016-01-01") <= policy_enddate ~ "inforce",
+
+      # Default case (shouldn't occur with proper data)
+      TRUE ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+
+filterlapse2_sim_policy_data_tbl |> glimpse()
+```
+
+
+
+We now construct the simulated cashflows from the simulated data.
+
+
+```{r filterlapse2_construct_simulated_cashflows}
+#| echo: true
+#| message: false
+
+filterlapse2_sim_cashflow_file <- glue("{stan_modeldir}/filterlapse2_sim_cashflow_tbl.parquet")
+
+# Check if cached simulated cashflow data exists
+if (file_exists(filterlapse2_sim_cashflow_file)) {
+  message(glue("Loading cached simulated cashflows from {filterlapse2_sim_cashflow_file}"))
+  filterlapse2_sim_cashflow_tbl <- read_parquet(filterlapse2_sim_cashflow_file)
+  
+} else {
+  message(glue("Computing simulated cashflows, will save to {filterlapse2_sim_cashflow_file}"))
+  
+  filterlapse2_sim_cashflow_tbl <- filterlapse2_sim_policy_data_tbl |>
+    group_nest(draw_id) |>
+    mutate(
+      newdata = map(
+        data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+                    
+        .progress = "joining_data")
+        ) |>
+    select(-data) |>
+    unnest(newdata)
+  
+  # Save for future use
+  filterlapse2_sim_cashflow_tbl |> write_parquet_compressed(filterlapse2_sim_cashflow_file)
+  message(glue("Simulated cashflows saved to {filterlapse2_sim_cashflow_file}"))
+}
+
+filterlapse2_sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse2_construct_simulated_monthly_cashflows}
+#| echo: true
+
+filterlapse2_sim_monthly_cashflow_tbl <- filterlapse2_sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+filterlapse2_sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse2_construct_comparison_plot}
+#| echo: true
+
+ggplot(filterlapse2_sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse2_stanmodel_name}")
+    )
+```
+
+We create a similar plot using ribbons using quantiles of the simulated
+cashflows.
+
+```{r filterlapse2_construct_comparison_plot_ribbons}
+#| echo: true
+
+filterlapse2_sim_monthly_bands_tbl <- filterlapse2_sim_monthly_cashflow_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse2_sim_monthly_bands_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse2_stanmodel_name}"),
+    subtitle = "Showing 50% and 80% bands"
+    )
+```
+
+
+### Recent Policies Only (2010+)
+
+We now repeat both visualizations, but restrict the data to only policies that
+have a start date from 2010-01-01 onwards, so that we are focusing solely on
+more recently incepted policies.
+
+```{r filterlapse2_filter_recent_policies}
+#| echo: true
+
+# Filter simulated cashflows for recent policies
+filterlapse2_sim_monthly_cashflow_recent_tbl <- filterlapse2_sim_cashflow_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r filterlapse2_construct_comparison_plot_recent}
+#| echo: true
+
+ggplot(filterlapse2_sim_monthly_cashflow_recent_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse2_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01)"
+    )
+```
+
+```{r filterlapse2_construct_comparison_plot_ribbons_recent}
+#| echo: true
+
+filterlapse2_sim_monthly_bands_recent_tbl <- filterlapse2_sim_monthly_cashflow_recent_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse2_sim_monthly_bands_recent_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse2_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01), showing 50% and 80% bands"
+    )
+```
+
+
+We now clean up the environment before building the next model.
+
+```{r filterlapse2_clear_large_objects}
+#| echo: false
+
+# Save tibbles before removing
+filterlapse2_post_survival_tbl |>
+  write_parquet(glue("{stan_modeldir}/filterlapse2_post_survival_tbl.parquet"))
+
+filterlapse2_sim_cashflow_tbl  |>
+  write_parquet(glue("{stan_modeldir}/filterlapse2_sim_cashflow_tbl.parquet"))
+
+# Remove large objects
+rm(filterlapse2_post_survival_tbl, filterlapse2_post_draws_lst, filterlapse2_sim_cashflow_tbl)
+
+gc(verbose = TRUE)
+```
+
+
+
+# Add Time-Dependent Parameters
+
+We now want to add a number of covariates to the model to see if we can improve
+it.
+
+## rstanarm Model
+
+
+```{r filterlapse3_fit_cox_model_rstanarm}
+#| echo: true
+#| message: false
+
+filterlapse3_stanmodel_name <- "filterlapse3_coxph_stansurv"
+filterlapse3_stanmodel_file <- glue("{stan_modeldir}/{filterlapse3_stanmodel_name}.qs")
+
+# Check if fitted model exists, load it if so, otherwise fit new model
+if (file_exists(filterlapse3_stanmodel_file)) {
+  message(glue("Loading cached model from {filterlapse3_stanmodel_file}"))
+  filterlapse3_coxph_stansurv <- qread(filterlapse3_stanmodel_file)
+
+} else {
+  message(glue("Fitting new model, will save to {filterlapse3_stanmodel_file}"))
+
+  # Create stan_model directory if it doesn't exist
+  dir_create(stan_modeldir, recurse = TRUE)
+  
+  filterlapse3_coxph_stansurv <- stan_surv(
+    Surv(policy_lifetime, lapsed) ~ gender_life1 + tve(smoker_life1, df = 5, degree = 2),
+    data   = model_training_tbl,
+    
+    # MCMC sampling parameters
+    chains = 4,
+    iter   = 2000,
+    warmup = 1000,
+    seed   = 4000,
+    cores  = 4,
+    
+    # Baseline hazard specification
+    basehaz     = "ms",  # M-splines (flexible, default)
+    basehaz_ops = list(df = 6),  # Degrees of freedom for baseline hazard
+    
+    # Prior specifications (explicit is better than implicit)
+    prior           = rstanarm::normal(location = 0, scale = 2.5), # Weakly informative for coefficients
+    prior_intercept = rstanarm::normal(location = 0, scale = 10),  # For baseline hazard
+    
+    # Enable verbose output for console monitoring (not captured in document)
+    refresh = 200  # Print progress every 200 iterations
+    )
+  
+  # Save fitted model for future use
+  filterlapse3_coxph_stansurv |> qsave(filterlapse3_stanmodel_file, preset = "balanced")
+  message(glue("Model saved to {filterlapse3_stanmodel_file}"))
+}
+```
+
+```{r filterlapse3_fit_cox_model_rstanarm_summary}
+#| echo: true
+#| message: true
+
+summary(filterlapse3_coxph_stansurv)
+```
+
+
+## Model Diagnostics
+
+We examine the MCMC diagnostics for the time-varying effects model. This model
+includes a spline-based time-varying effect for the smoker status, allowing
+the hazard ratio to change over policy lifetime.
+
+```{r filterlapse3_model_diagnostics_convergence}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 5
+
+plot_stan_convergence(
+  filterlapse3_coxph_stansurv,
+  title = "Model 3 Convergence Diagnostics: Gender + Time-Varying Smoker Effect"
+  )
+```
+
+
+```{r filterlapse3_model_diagnostics_mixing}
+#| echo: true
+#| fig-width: 14
+#| fig-height: 10
+
+plot_stan_mixing(
+  filterlapse3_coxph_stansurv,
+  title = "Model 3 Chain Mixing: Gender + Time-Varying Smoker Effect"
+  )
+```
+
+
+## Construct Posterior Survival Estimates
+
+We now want to use our fitted model to predict the lapse for the portfolio.
+
+We model the monthly paid premia in the portfolio for the final year for which
+we have data. We can then compare our modelled cashflows against the observed
+data.
+
+```{r filterlapse3_construct_rstanarm_posterior_estimates}
+#| echo: true
+
+filterlapse3_post_draws_file <- glue("{stan_modeldir}/filterlapse3_post_draws_lst.qs")
+
+# Check if cached posterior draws exist
+if (file_exists(filterlapse3_post_draws_file)) {
+  message(glue("Loading cached posterior draws from {filterlapse3_post_draws_file}"))
+  filterlapse3_post_draws_lst <- qread(filterlapse3_post_draws_file)
+  
+} else {
+  message(glue("Computing posterior draws, will save to {filterlapse3_post_draws_file}"))
+  
+  filterlapse3_post_draws_lst <- posterior_survfit(
+      filterlapse3_coxph_stansurv,
+      newdata       = inforce_tbl,
+      last_time     = NULL,
+      draws         = 2000,
+      condition     = TRUE,
+      return_matrix = TRUE
+      )
+  
+  # Save for future use
+  filterlapse3_post_draws_lst |> qsave(filterlapse3_post_draws_file, preset = "balanced")
+  message(glue("Posterior draws saved to {filterlapse3_post_draws_file}"))
+}
+
+filterlapse3_post_draws_lst[[1]] |> glimpse()
+```
+
+
+```{r filterlapse3_extract_posterior_survival_estimates}
+#| echo: true
+#| message: false
+
+filterlapse3_cashflow_week_count <- monthly_tbl |> pull(weeks)
+
+filterlapse3_post_survival_file <- glue("{stan_modeldir}/filterlapse3_post_survival_tbl.parquet")
+
+# Check if cached posterior survival data exists
+if (file_exists(filterlapse3_post_survival_file)) {
+  message(glue("Loading cached posterior survival data from {filterlapse3_post_survival_file}"))
+  filterlapse3_post_survival_tbl <- read_parquet(filterlapse3_post_survival_file)
+  
+} else {
+  message(glue("Extracting posterior survival data, will save to {filterlapse3_post_survival_file}"))
+  
+  filterlapse3_post_survival_tbl <- filterlapse3_post_draws_lst |>
+    map_dfr(
+      extract_stansurv_posterior_survivals,
+
+      .progress = "extract_post_surv"
+      ) |>
+    filter(time < 5 * 52) |>
+    mutate(
+      policy_id = inforce_tbl$policy_id[idx],
+      
+      .before = 1
+      ) |>
+    select(policy_id, draw_id, time, post_surv_prob = value) |>
+    interpolate_survival_data(
+      new_times = filterlapse3_cashflow_week_count
+      ) |>
+    group_nest(policy_id, draw_id)
+  
+  # Save for future use
+  filterlapse3_post_survival_tbl |> write_parquet_compressed(filterlapse3_post_survival_file)
+  message(glue("Posterior survival data saved to {filterlapse3_post_survival_file}"))
+}
+
+filterlapse3_post_survival_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse3_calculate_sim_lapse_times}
+#| echo: true
+#| message: false
+
+filterlapse3_sim_lapse_times_file <- glue("{stan_modeldir}/filterlapse3_sim_lapse_times_tbl.parquet")
+
+# Check if cached simulated lapse times exist
+if (file_exists(filterlapse3_sim_lapse_times_file)) {
+  message(glue("Loading cached simulated lapse times from {filterlapse3_sim_lapse_times_file}"))
+  filterlapse3_sim_lapse_times_tbl <- read_parquet(filterlapse3_sim_lapse_times_file)
+  
+} else {
+  message(glue("Computing simulated lapse times, will save to {filterlapse3_sim_lapse_times_file}"))
+  
+  filterlapse3_sim_lapse_times_tbl <- filterlapse3_post_survival_tbl |>
+    mutate(
+      rnd_draw   = runif(n(), 0, 1),
+      lapse_time = map2_dbl(
+        data, rnd_draw,
+        \(x, y) extract_survival_time(x, y, min_time = 1),
+
+        .progress = "extract_survival_time"
+        )
+      ) |>
+    select(policy_id, draw_id, lapse_time)
+  
+  # Save for future use
+  filterlapse3_sim_lapse_times_tbl |> write_parquet_compressed(filterlapse3_sim_lapse_times_file)
+  message(glue("Simulated lapse times saved to {filterlapse3_sim_lapse_times_file}"))
+}
+
+filterlapse3_sim_lapse_times_tbl |> glimpse()
+```
+
+
+
+```{r filterlapse3_construct_policy_sim_data}
+#| echo: true
+
+filterlapse3_sim_policy_data_tbl <- filterlapse3_sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+
+      # Policy has expired (term ended)
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+
+      # Policy has lapsed and the lapse occurred before or on the reference date
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01")) ~ "lapsed",
+
+      # Policy is within term and either not lapsed or lapsed after reference date
+      as.Date("2016-01-01") <= policy_enddate ~ "inforce",
+
+      # Default case (shouldn't occur with proper data)
+      TRUE ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+
+filterlapse3_sim_policy_data_tbl |> glimpse()
+```
+
+
+
+We now construct the simulated cashflows from the simulated data.
+
+
+```{r filterlapse3_construct_simulated_cashflows}
+#| echo: true
+#| message: false
+
+filterlapse3_sim_cashflow_file <- glue("{stan_modeldir}/filterlapse3_sim_cashflow_tbl.parquet")
+
+# Check if cached simulated cashflow data exists
+if (file_exists(filterlapse3_sim_cashflow_file)) {
+  message(glue("Loading cached simulated cashflows from {filterlapse3_sim_cashflow_file}"))
+  filterlapse3_sim_cashflow_tbl <- read_parquet(filterlapse3_sim_cashflow_file)
+  
+} else {
+  message(glue("Computing simulated cashflows, will save to {filterlapse3_sim_cashflow_file}"))
+  
+  filterlapse3_sim_cashflow_tbl <- filterlapse3_sim_policy_data_tbl |>
+    group_nest(draw_id) |>
+    mutate(
+      newdata = map(
+        data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+
+        .progress = "joining_data")
+        ) |>
+    select(-data) |>
+    unnest(newdata)
+  
+  # Save for future use
+  filterlapse3_sim_cashflow_tbl |> write_parquet_compressed(filterlapse3_sim_cashflow_file)
+  message(glue("Simulated cashflows saved to {filterlapse3_sim_cashflow_file}"))
+}
+
+filterlapse3_sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse3_construct_simulated_monthly_cashflows}
+#| echo: true
+
+filterlapse3_sim_monthly_cashflow_tbl <- filterlapse3_sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+filterlapse3_sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r filterlapse3_construct_comparison_plot}
+#| echo: true
+
+ggplot(filterlapse3_sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse3_stanmodel_name}")
+    )
+```
+
+We create a similar plot using ribbons using quantiles of the simulated
+cashflows.
+
+```{r filterlapse3_construct_comparison_plot_ribbons}
+#| echo: true
+
+filterlapse3_sim_monthly_bands_tbl <- filterlapse3_sim_monthly_cashflow_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse3_sim_monthly_bands_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse3_stanmodel_name}"),
+    subtitle = "Showing 50% and 80% bands"
+    )
+```
+
+
+### Recent Policies Only (2010+)
+
+We now repeat both visualizations, but restrict the data to only policies that
+have a start date from 2010-01-01 onwards, so that we are focusing solely on
+more recently incepted policies.
+
+```{r filterlapse3_filter_recent_policies}
+#| echo: true
+
+# Filter simulated cashflows for recent policies
+filterlapse3_sim_monthly_cashflow_recent_tbl <- filterlapse3_sim_cashflow_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  summarise(
+    total_cashflow = sum(cashflow),
+    
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r filterlapse3_construct_comparison_plot_recent}
+#| echo: true
+
+ggplot(filterlapse3_sim_monthly_cashflow_recent_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title = glue("Simulated vs Actual Cashflows for Model {filterlapse3_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01)"
+    )
+```
+
+```{r filterlapse3_construct_comparison_plot_ribbons_recent}
+#| echo: true
+
+filterlapse3_sim_monthly_bands_recent_tbl <- filterlapse3_sim_monthly_cashflow_recent_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+    
+    .by = c(cashflow_date)
+    )
+
+ggplot(filterlapse3_sim_monthly_bands_recent_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x = "Time",
+    y = "Cashflow",
+    title    = glue("Simulated vs Actual Cashflows for Model {filterlapse3_stanmodel_name}"),
+    subtitle = "Recent policies (start date >= 2010-01-01), showing 50% and 80% bands"
+    )
+```
+
+
+# Chunk Timing Summary
+
+This section summarizes the execution time for all chunks in this notebook.
+
+```{r chunk_timing_summary}
+#| echo: false
+
+# Create timing summary table
+timing_summary_tbl <- tibble(
+  chunk_label = names(chunk_times),
+  seconds = unlist(chunk_times)
+  ) |>
+  arrange(desc(seconds)) |>
+  mutate(
+    minutes = round(seconds / 60, 2),
+    hours = round(seconds / 3600, 2),
+    formatted = case_when(
+      seconds < 60 ~ glue("{round(seconds, 1)} sec"),
+      seconds < 3600 ~ glue("{minutes} min"),
+      TRUE ~ glue("{hours} hr")
+      )
+    )
+
+# Print summary
+message("")
+message(strrep("=", 80))
+message("CHUNK EXECUTION TIMES (slowest first)")
+message(strrep("=", 80))
+message("")
+
+timing_summary_tbl |>
+  select(chunk_label, formatted) |>
+  print(n = Inf)
+
+message("")
+message(strrep("-", 80))
+total_time <- sum(timing_summary_tbl$seconds)
+message(glue("Total execution time: {round(total_time/60, 2)} minutes ({round(total_time, 1)} seconds)"))
+message(strrep("=", 80))
+
+# Save to file for future reference
+dir_create("chunk_timings", recurse = TRUE)
+timing_output_file <- glue("chunk_timings/chunk_timings_{format(Sys.time(), '%Y%m%d_%H%M%S')}.parquet")
+timing_summary_tbl |> write_parquet_compressed(timing_output_file)
+message(glue("Timing data saved to: {timing_output_file}"))
+```
+
+

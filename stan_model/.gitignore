@@ -1,0 +1,6 @@
+model*
+
+*.csv
+*.rds
+*.qs
+*.parquet
