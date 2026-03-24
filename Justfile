@@ -75,7 +75,8 @@ all-html: \
   classic_survival_models \
   initial_bayesian_survival \
   bayesian_survival_filtered_data \
-  conditional_survival_prediction
+  conditional_survival_prediction \
+  bayesian_survival_talk
 
 # Render all Bayesian models on host
 all-bayesian: initial_bayesian_survival bayesian_survival_filtered_data
@@ -83,6 +84,10 @@ all-bayesian: initial_bayesian_survival bayesian_survival_filtered_data
 # Render exploratory data analysis notebook locally
 exploration_lifebook_data:
   just _render-qmd exploration_lifebook_data.qmd local
+
+# Render presentation slides locally
+bayesian_survival_talk:
+  just _render-qmd bayesian_survival_talk.qmd local
 
 # Render exploratory data analysis notebook locally (alias)
 explore: exploration_lifebook_data
@@ -125,7 +130,8 @@ podman-all-html: \
   podman-classic_survival_models \
   podman-initial_bayesian_survival \
   podman-bayesian_survival_filtered_data \
-  podman-conditional_survival_prediction
+  podman-conditional_survival_prediction \
+  podman-bayesian_survival_talk
 
 # Render all Bayesian models in podman
 podman-all-bayesian: podman-initial_bayesian_survival podman-bayesian_survival_filtered_data
@@ -133,6 +139,10 @@ podman-all-bayesian: podman-initial_bayesian_survival podman-bayesian_survival_f
 # Render exploratory data analysis notebook in podman
 podman-exploration_lifebook_data:
   just _render-qmd exploration_lifebook_data.qmd podman
+
+# Render presentation slides in podman
+podman-bayesian_survival_talk:
+  just _render-qmd bayesian_survival_talk.qmd podman
 
 # Render classical survival models notebook in podman
 podman-classic_survival_models: podman-exploration_lifebook_data
@@ -157,35 +167,34 @@ podman-conditional_survival_prediction: podman-classic_survival_models podman-ex
 # Clean all generated files
 clean-all: clean-html clean-models clean-predictions clean-cache clean-outputs
 
-# Remove all HTML output files
+# Remove all production HTML output files (excludes temp_ and tmp_ files)
 clean-html:
-  rm -fv *.html
+  @find . -maxdepth 1 -name "*.html" ! -name "temp_*" ! -name "tmp_*" -exec rm -fv {} +
 
-# Remove Stan model files
+# Remove production Stan model files (excludes temp_ and tmp_ files)
 clean-models:
-  rm -fv stan_model/*
+  @find stan_model/ -maxdepth 1 ! -name "temp_*" ! -name "tmp_*" ! -name ".gitignore" -exec rm -fv {} +
 
-# Remove generated prediction files
+# Remove production prediction files (excludes temp_ and tmp_ files)
 clean-predictions:
-  rm -fv predictions/*
+  @find predictions/ -maxdepth 1 ! -name "temp_*" ! -name "tmp_*" ! -name ".gitignore" -exec rm -fv {} +
 
-# Remove Quarto cache
+# Remove production Quarto cache (excludes temp_ and tmp_ files)
 clean-cache:
-  rm -rf *_cache/
-  rm -rf *_files/
+  @find . -maxdepth 1 \( -name "*_cache" -o -name "*_files" \) ! -name "temp_*" ! -name "tmp_*" -exec rm -rfv {} +
   rm -rf .just-cache/
 
 # Remove output logs
 clean-outputs:
   rm -fv output.log
 
-# Remove chunk timing files
+# Remove production chunk timing files (excludes temp_ and tmp_ files)
 clean-timing:
-  rm -fv chunk_timings/*.parquet
+  @find chunk_timings/ -maxdepth 1 -name "*.parquet" ! -name "temp_*" ! -name "tmp_*" -exec rm -fv {} +
 
-# Clean Stan output CSVs
+# Clean production Stan output CSVs (excludes temp_ and tmp_ files)
 clean-stan-output:
-  rm -fv stan_output/*.csv
+  @find stan_output/ -maxdepth 1 -name "*.csv" ! -name "temp_*" ! -name "tmp_*" -exec rm -fv {} +
 
 # Nuclear option: remove all generated and cached files
 nuke: clean-all clean-timing clean-stan-output
@@ -290,11 +299,17 @@ check-quarto:
 check-r:
   @R --version
 
-# Validate all QMD files without rendering
+# Validate all production QMD files without rendering (excludes temp_ and tmp_ files)
 validate:
   @for file in *.qmd; do \
-    echo "Validating $$file..."; \
-    quarto render "$$file" --to html --execute false || exit 1; \
+    case "$$file" in \
+      temp_*|tmp_*) \
+        continue ;; \
+      *) \
+        echo "Validating $$file..."; \
+        quarto render "$$file" --to html --execute false || exit 1; \
+        ;; \
+    esac \
   done
 
 # Show project info
@@ -354,9 +369,9 @@ disk-usage:
   @echo "Project disk usage:"
   @du -sh data/ stan_model/ fitted_models/ chunk_timings/ 2>/dev/null | sort -h || echo "Some directories not found"
 
-# Show all HTML output files
+# Show all HTML output files (excludes temp_ and tmp_ files)
 list-html:
-  @ls -lh *.html 2>/dev/null || echo "No HTML files found"
+  @ls -lh *.html 2>/dev/null | grep -vE 'temp_|tmp_' || echo "No production HTML files found"
 
 # Show recent log entries
 show-logs:
