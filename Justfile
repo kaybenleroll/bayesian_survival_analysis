@@ -155,7 +155,7 @@ podman-conditional_survival_prediction: podman-classic_survival_models podman-ex
 # =============================================================================
 
 # Clean all generated files
-clean-all: clean-html clean-models clean-cache clean-outputs
+clean-all: clean-html clean-models clean-predictions clean-cache clean-outputs
 
 # Remove all HTML output files
 clean-html:
@@ -164,6 +164,10 @@ clean-html:
 # Remove Stan model files
 clean-models:
   rm -fv stan_model/*
+
+# Remove generated prediction files
+clean-predictions:
+  rm -fv predictions/*
 
 # Remove Quarto cache
 clean-cache:

@@ -80,9 +80,10 @@ message(glue(
 
 message("write_parquet_compressed() loaded from lib_utils.R (zstd level 3 default)")
 
-stan_modeldir <- "stan_model"
-stan_codedir  <- "stan_code"
-data_dir      <- "data"
+stan_modeldir   <- "stan_model"
+stan_codedir    <- "stan_code"
+predictions_dir <- "predictions"
+data_dir        <- "data"
 
 
 set.seed(42)
@@ -525,7 +526,7 @@ policy-level lapse time simulation without re-running MCMC.
 #| echo: true
 #| message: false
 
-lapse1_post_survival_file <- glue("{stan_modeldir}/lapse1_post_survival_tbl.parquet")
+lapse1_post_survival_file <- glue("{predictions_dir}/lapse1_post_survival_tbl.parquet")
 
 # Check if cached posterior survival data exists
 if (file_exists(lapse1_post_survival_file)) {
@@ -572,7 +573,7 @@ focused projection window.
 #| echo: true
 #| message: false
 
-lapse1_sim_lapse_times_file <- glue("{stan_modeldir}/lapse1_sim_lapse_times_tbl.parquet")
+lapse1_sim_lapse_times_file <- glue("{predictions_dir}/lapse1_sim_lapse_times_tbl.parquet")
 
 # Check if cached simulated lapse times exist
 if (file_exists(lapse1_sim_lapse_times_file)) {
@@ -654,7 +655,7 @@ logic in subsequent cashflow generation.
 #| echo: true
 #| message: false
 
-lapse1_sim_cashflow_file <- glue("{stan_modeldir}/lapse1_sim_cashflow_tbl.parquet")
+lapse1_sim_cashflow_file <- glue("{predictions_dir}/lapse1_sim_cashflow_tbl.parquet")
 
 # Check if cached simulated cashflow data exists
 if (file_exists(lapse1_sim_cashflow_file)) {
@@ -935,8 +936,8 @@ We now clean up the environment before building the next model.
 #| echo: false
 
 # Save tibbles before removing
-lapse1_post_survival_tbl |> write_parquet(glue("{stan_modeldir}/lapse1_post_survival_tbl.parquet"))
-lapse1_sim_cashflow_tbl  |> write_parquet(glue("{stan_modeldir}/lapse1_sim_cashflow_tbl.parquet"))
+lapse1_post_survival_tbl |> write_parquet(glue("{predictions_dir}/lapse1_post_survival_tbl.parquet"))
+lapse1_sim_cashflow_tbl  |> write_parquet(glue("{predictions_dir}/lapse1_sim_cashflow_tbl.parquet"))
 
 # Remove large objects
 rm(lapse1_post_survival_tbl, lapse1_post_draws_lst, lapse1_sim_cashflow_tbl)
@@ -1090,7 +1091,7 @@ lapse2_post_draws_lst[[1]] |> glimpse()
 
 lapse2_cashflow_week_count <- monthly_tbl |> pull(weeks)
 
-lapse2_post_survival_file <- glue("{stan_modeldir}/lapse2_post_survival_tbl.parquet")
+lapse2_post_survival_file <- glue("{predictions_dir}/lapse2_post_survival_tbl.parquet")
 
 # Check if cached posterior survival data exists
 if (file_exists(lapse2_post_survival_file)) {
@@ -1136,7 +1137,7 @@ contribution to reducing residual variance.
 #| echo: true
 #| message: false
 
-lapse2_sim_lapse_times_file <- glue("{stan_modeldir}/lapse2_sim_lapse_times_tbl.parquet")
+lapse2_sim_lapse_times_file <- glue("{predictions_dir}/lapse2_sim_lapse_times_tbl.parquet")
 
 # Check if cached simulated lapse times exist
 if (file_exists(lapse2_sim_lapse_times_file)) {
@@ -1217,7 +1218,7 @@ We now construct the simulated cashflows from the simulated data.
 #| echo: true
 #| message: false
 
-lapse2_sim_cashflow_file <- glue("{stan_modeldir}/lapse2_sim_cashflow_tbl.parquet")
+lapse2_sim_cashflow_file <- glue("{predictions_dir}/lapse2_sim_cashflow_tbl.parquet")
 
 # Check if cached simulated cashflow data exists
 if (file_exists(lapse2_sim_cashflow_file)) {
@@ -1514,10 +1515,10 @@ We now clean up the environment before building the next model.
 
 # Save tibbles before removing
 lapse2_post_survival_tbl |>
-  write_parquet(glue("{stan_modeldir}/lapse2_post_survival_tbl.parquet"))
+  write_parquet(glue("{predictions_dir}/lapse2_post_survival_tbl.parquet"))
 
 lapse2_sim_cashflow_tbl  |>
-  write_parquet(glue("{stan_modeldir}/lapse2_sim_cashflow_tbl.parquet"))
+  write_parquet(glue("{predictions_dir}/lapse2_sim_cashflow_tbl.parquet"))
 
 # Remove large objects
 rm(lapse2_post_survival_tbl, lapse2_post_draws_lst, lapse2_sim_cashflow_tbl)
@@ -1669,7 +1670,7 @@ lapse3_post_draws_lst[[1]] |> glimpse()
 
 lapse3_cashflow_week_count <- monthly_tbl |> pull(weeks)
 
-lapse3_post_survival_file <- glue("{stan_modeldir}/lapse3_post_survival_tbl.parquet")
+lapse3_post_survival_file <- glue("{predictions_dir}/lapse3_post_survival_tbl.parquet")
 
 # Check if cached posterior survival data exists
 if (file_exists(lapse3_post_survival_file)) {
@@ -1715,7 +1716,7 @@ reduce mid-term uncertainty or simply re-allocate variance across time.
 #| echo: true
 #| message: false
 
-lapse3_sim_lapse_times_file <- glue("{stan_modeldir}/lapse3_sim_lapse_times_tbl.parquet")
+lapse3_sim_lapse_times_file <- glue("{predictions_dir}/lapse3_sim_lapse_times_tbl.parquet")
 
 # Check if cached simulated lapse times exist
 if (file_exists(lapse3_sim_lapse_times_file)) {
@@ -1797,7 +1798,7 @@ We now construct the simulated cashflows from the simulated data.
 #| echo: true
 #| message: false
 
-lapse3_sim_cashflow_file <- glue("{stan_modeldir}/lapse3_sim_cashflow_tbl.parquet")
+lapse3_sim_cashflow_file <- glue("{predictions_dir}/lapse3_sim_cashflow_tbl.parquet")
 
 # Check if cached simulated cashflow data exists
 if (file_exists(lapse3_sim_cashflow_file)) {
