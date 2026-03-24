@@ -106,8 +106,8 @@ models workbooks, which create the processed datasets and fitted Cox-PH models.
 set.seed(42)
 
 # Simulate the processed data structure that would come from other workbooks
-model_insample_tbl  <- read_parquet("data/model_insample_small_tbl.parquet")
-model_outsample_tbl <- read_parquet("data/model_outsample_small_tbl.parquet")
+model_insample_tbl  <- read_parquet("data/model_training_small_tbl.parquet")
+model_outsample_tbl <- read_parquet("data/model_rollforward_small_tbl.parquet")
 
 cat("Using simulated data structure for demonstration:\n")
 cat("In-sample:", nrow(model_insample_tbl), "observations\n")

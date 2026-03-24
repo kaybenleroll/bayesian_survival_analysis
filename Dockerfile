@@ -63,6 +63,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     benchmarkme \
     brms \
     broom \
+    condSURV \
     conflicted \
     cowplot \
     DataExplorer \
@@ -88,6 +89,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     qs \
     quarto \
     regplot \
+    riskRegression \
+    rms \
     rstan \
     sessioninfo \
     shinybrms \
@@ -104,6 +107,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
     tidygraph \
     tidymodels \
     tidyquant \
+    timeROC \
     timetk
 
 

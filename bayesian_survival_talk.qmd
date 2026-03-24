@@ -106,7 +106,7 @@ actual_monthly_lowprem_tbl <- actual_cashflows_tbl |>
 ```{r load_data_lapse1}
 #| echo: false
 
-lapse1_sim_cashflow_tbl <- read_parquet("data/lapse1_sim_cashflow_tbl.parquet")
+lapse1_sim_cashflow_tbl <- read_parquet("predictions/lapse1_sim_cashflow_tbl.parquet")
 
 lapse1_sim_monthly_cashflow_tbl <- lapse1_sim_cashflow_tbl |>
   summarise(
@@ -145,7 +145,7 @@ lapse1_sim_monthly_cashflow_lowprem_tbl <- lapse1_sim_cashflow_tbl |>
 ```{r load_data_lapse2}
 #| echo: false
 
-lapse2_sim_cashflow_tbl <- read_parquet("data/lapse2_sim_cashflow_tbl.parquet")
+lapse2_sim_cashflow_tbl <- read_parquet("predictions/lapse2_sim_cashflow_tbl.parquet")
 
 lapse2_sim_monthly_cashflow_tbl <- lapse2_sim_cashflow_tbl |>
   summarise(
