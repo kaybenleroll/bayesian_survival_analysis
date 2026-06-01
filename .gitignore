@@ -22,3 +22,5 @@ tmp*
 
 precompute_*.bz2
 
+.scratch/
+chunk_timings/*.parquet

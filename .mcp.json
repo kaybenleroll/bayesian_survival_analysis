@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "sequential-thinking": {
+      "command": "/home/mcooney/.local/share/mise/installs/node/latest/bin/mcp-server-sequential-thinking",
+      "args": []
+    }
+  }
+}

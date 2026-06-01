@@ -1,4 +1,36 @@
 # =============================================================================
+# BAYESIAN SURVIVAL ANALYSIS - BUILD SYSTEM
+# =============================================================================
+#
+# OVERVIEW:
+# This Justfile manages the rendering pipeline for a series of interconnected
+# Quarto notebooks. It supports both local execution and containerized execution
+# via Podman to ensure absolute reproducibility.
+#
+# DEPENDENCY MANAGEMENT & "MAKE-LIKE" BEHAVIOR:
+# This project uses a directed acyclic graph (DAG) to manage dependencies between
+# notebooks (e.g., Model B requires Data from Notebook A).
+# 
+# We implement this using Content Hashing (MD5) rather than traditional file
+# timestamps (mtime). 
+# 
+# Why Content Hashing over Timestamps?
+# 1. Git-Safety: Switching branches or pulling code updates file timestamps to 
+#    "now". Traditional `make` would trigger a massive, unnecessary rebuild. 
+#    Content hashing only rebuilds if the actual text/data changed.
+# 2. Precision: Saving a file without modifying it (or touching it) won't 
+#    trigger false-positive rebuilds.
+#
+# How it works:
+# The `_needs_rebuild` helper computes a combined MD5 hash of:
+#   1. The target `.qmd` file.
+#   2. Core shared R libraries (`lib_*.R`).
+#   3. ANY upstream artifacts specified in `*extra_deps` (like the output .html
+#      or .parquet files of a preceding notebook).
+# If this combined hash differs from the one stored in `.just-cache/`, a rebuild
+# is triggered. Downstream notebooks automatically rebuild when upstream outputs change.
+#
+# =============================================================================
 # PROJECT CONFIGURATION
 # =============================================================================
 
@@ -30,10 +62,14 @@ default:
 # =============================================================================
 
 # Internal helper: Check if rebuild needed based on content hash
+# This provides Make-like dependency management but uses MD5 checksums instead of 
+# timestamps. This makes the pipeline "Git-safe" (switching branches won't 
+# trigger a rebuild unless the content actually changed).
 _needs_rebuild output *sources:
   #!/usr/bin/env bash
   mkdir -p .just-cache
-  # Combine all source files and compute hash
+  # Combine all source files and compute a single hash. If an upstream 
+  # dependency is an .html file, its content changes will trigger a rebuild here.
   combined_hash=$(cat {{sources}} 2>/dev/null | md5sum | cut -d' ' -f1)
   cache_file=".just-cache/$(basename {{output}}).md5"
   
@@ -41,17 +77,23 @@ _needs_rebuild output *sources:
      [ ! -f "$cache_file" ] || \
      [ "$combined_hash" != "$(cat $cache_file 2>/dev/null)" ]; then
     echo "$combined_hash" > "$cache_file"
-    exit 0  # needs rebuild
+    exit 0  # Hash changed or output missing: needs rebuild
   else
-    echo "$(basename {{output}}) is up to date (no content changes)"
-    exit 1  # skip rebuild
+    echo "$(basename {{output}}) is up to date (no content changes)."
+    exit 1  # Hash matches: skip rebuild
   fi
 
 # Internal helper: Render a single QMD file
-_render-qmd qmd_file mode="local":
+# This is the core rendering engine. It accepts a list of *extra_deps which allows
+# us to build a directed acyclic graph (DAG) of notebooks. If notebook B 
+# depends on the HTML output of notebook A, we list B's extra_deps as A.html.
+_render-qmd qmd_file mode="local" *extra_deps="":
   #!/usr/bin/env bash
-  html_file="${1%.qmd}.html"
-  all_deps="{{qmd_file}} lib_utils.R lib_survival_modelling.R lib_stan_diagnostics.R lib_brms_hazard.R"
+  qmd="{{qmd_file}}"
+  html_file="${qmd%.qmd}.html"
+  # Dependencies include the script itself, core R libraries, and any specified
+  # upstream artifacts (like .html or .parquet files).
+  all_deps="{{qmd_file}} lib_utils.R lib_survival_modelling.R lib_stan_diagnostics.R lib_brms_hazard.R {{extra_deps}}"
   
   if just _needs_rebuild "$html_file" $all_deps; then
     echo "TIMESTAMP: $(date) - Rendering script {{qmd_file}} (Mode: {{mode}})" >> output.log 2>&1
@@ -68,6 +110,10 @@ _render-qmd qmd_file mode="local":
 # =============================================================================
 # LOCAL RENDERING TARGETS (Host Machine)
 # =============================================================================
+
+# Render a specific QMD file locally without dependencies
+render qmd_file:
+  just _render-qmd {{qmd_file}} local
 
 # Generate all HTML files from QMD files on host
 all-html: \
@@ -94,28 +140,28 @@ explore: exploration_lifebook_data
 
 # Render classical survival models notebook locally
 classic_survival_models: exploration_lifebook_data
-  just _render-qmd classic_survival_models.qmd local
+  just _render-qmd classic_survival_models.qmd local "exploration_lifebook_data.html"
 
 # Render classical survival models locally (alias)
 classic: classic_survival_models
 
 # Render initial Bayesian survival analysis notebook locally
 initial_bayesian_survival: exploration_lifebook_data
-  just _render-qmd initial_bayesian_survival.qmd local
+  just _render-qmd initial_bayesian_survival.qmd local "exploration_lifebook_data.html"
 
 # Render initial Bayesian survival analysis locally (alias)
 initial: initial_bayesian_survival
 
 # Render filtered Bayesian survival analysis notebook locally
 bayesian_survival_filtered_data: exploration_lifebook_data
-  just _render-qmd bayesian_survival_filtered_data.qmd local
+  just _render-qmd bayesian_survival_filtered_data.qmd local "exploration_lifebook_data.html"
 
 # Render filtered Bayesian survival analysis locally (alias)
 filtered: bayesian_survival_filtered_data
 
 # Render conditional survival prediction notebook locally
 conditional_survival_prediction: classic_survival_models exploration_lifebook_data
-  just _render-qmd conditional_survival_prediction.qmd local
+  just _render-qmd conditional_survival_prediction.qmd local "classic_survival_models.html exploration_lifebook_data.html"
 
 # Render conditional survival prediction locally (alias)
 conditional: conditional_survival_prediction
@@ -123,6 +169,10 @@ conditional: conditional_survival_prediction
 # =============================================================================
 # PODMAN RENDERING TARGETS (Container)
 # =============================================================================
+
+# Render a specific QMD file in podman without dependencies
+podman-render qmd_file:
+  just _render-qmd {{qmd_file}} podman
 
 # Generate all HTML files from QMD files in podman
 podman-all-html: \
@@ -146,19 +196,19 @@ podman-bayesian_survival_talk:
 
 # Render classical survival models notebook in podman
 podman-classic_survival_models: podman-exploration_lifebook_data
-  just _render-qmd classic_survival_models.qmd podman
+  just _render-qmd classic_survival_models.qmd podman "exploration_lifebook_data.html"
 
 # Render initial Bayesian survival analysis notebook in podman
 podman-initial_bayesian_survival: podman-exploration_lifebook_data
-  just _render-qmd initial_bayesian_survival.qmd podman
+  just _render-qmd initial_bayesian_survival.qmd podman "exploration_lifebook_data.html"
 
 # Render filtered Bayesian survival analysis notebook in podman
 podman-bayesian_survival_filtered_data: podman-exploration_lifebook_data
-  just _render-qmd bayesian_survival_filtered_data.qmd podman
+  just _render-qmd bayesian_survival_filtered_data.qmd podman "exploration_lifebook_data.html"
 
 # Render conditional survival prediction notebook in podman
 podman-conditional_survival_prediction: podman-classic_survival_models podman-exploration_lifebook_data
-  just _render-qmd conditional_survival_prediction.qmd podman
+  just _render-qmd conditional_survival_prediction.qmd podman "classic_survival_models.html exploration_lifebook_data.html"
 
 # =============================================================================
 # CLEANING TARGETS
