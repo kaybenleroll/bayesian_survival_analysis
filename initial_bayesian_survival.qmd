@@ -50,6 +50,28 @@ library(splines2)
 library(rstanarm)
 
 
+cmdstan_candidate_dirs <- dir_ls(
+  "/home/rstudio/.cmdstan",
+  type = "directory",
+  recurse = FALSE,
+  fail = FALSE
+  ) |>
+  keep(
+    ~str_detect(path_file(.x), "^cmdstan-")
+    )
+
+if (length(cmdstan_candidate_dirs) > 0) {
+  cmdstan_path_is_set <- !inherits(
+    try(cmdstanr::cmdstan_path(), silent = TRUE),
+    "try-error"
+    )
+
+  if (!cmdstan_path_is_set) {
+    cmdstanr::set_cmdstan_path(cmdstan_candidate_dirs[[length(cmdstan_candidate_dirs)]])
+    }
+}
+
+
 source("lib_utils.R")
 source("lib_brms_hazard.R")
 source("lib_survival_modelling.R")
@@ -371,6 +393,134 @@ summary(lapse1_coxph_brmsfit)
 The `brms` fit provides a foundation for potential spline or hierarchical
 extensions. For operational projections we proceed with the `rstanarm` version
 whose survival extraction helpers we leverage in later sections.
+
+
+## brms Model with Baseline Strata
+
+`brms` supports stratified Cox baselines through the response-side
+`bhaz(gr = ...)` term. Here we let the baseline hazard vary by
+`smoker_life1`, which means smoker status defines separate baseline hazard
+functions rather than entering the proportional-hazards linear predictor as a
+single coefficient.
+
+```{r lapse1_fit_cox_model_brms_smoker_strata}
+#| echo: true
+#| message: false
+#| results: hide
+
+lapse1_smoker_strata_stanmodel_name <- "lapse1_smoker_strata_coxph_brms"
+
+lapse1_smoker_strata_coxph_brmsfit <- brm(
+  policy_lifetime | cens(1 - lapsed) + bhaz(gr = smoker_life1, df = 8) ~ gender_life1,
+  data            = model_training_tbl,
+  family          = cox(link = "log"),
+  backend         = "cmdstanr",
+  chains          = 4,
+  cores           = 4,
+  seed            = stanfit_seed,
+  save_warmup     = FALSE,
+  save_model      = glue("{stan_codedir}/{lapse1_smoker_strata_stanmodel_name}.stan"),
+  file            = glue("{stan_modeldir}/{lapse1_smoker_strata_stanmodel_name}_brmsfit"),
+  output_dir      = stan_modeldir,
+  output_basename = lapse1_smoker_strata_stanmodel_name,
+
+  stan_model_args = list(
+    include_paths = "stan_code",
+    pedantic      = TRUE,
+    dir           = "stan_model"
+    )
+  )
+```
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_summary}
+#| echo: true
+
+summary(lapse1_smoker_strata_coxph_brmsfit)
+```
+
+The updated helper functions can now enumerate baseline strata and extract each
+stratum-specific baseline hazard directly from the fitted `brms` object.
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_baseline_strata}
+#| echo: true
+
+lapse1_smoker_strata_tbl <- extract_baseline_strata(
+  lapse1_smoker_strata_coxph_brmsfit
+  )
+
+lapse1_smoker_strata_tbl
+```
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_baseline_hazard}
+#| echo: true
+#| fig-width: 12
+#| fig-height: 5
+
+lapse1_smoker_strata_hazard_plot <- plot_baseline_hazard(
+  lapse1_smoker_strata_coxph_brmsfit,
+  show_draws = 0
+  )
+
+lapse1_smoker_strata_hazard_plot
+```
+
+
+## brms Model with Smoker-Stratified Baseline and Standard Covariates
+
+For a more useful working specification, we can keep smoker status in the
+baseline hazard strata while estimating the remaining effects as ordinary Cox
+regression coefficients. This mirrors the richer classical specification used
+later in the notebook, but removes `smoker_life1` from the linear predictor so
+its effect is absorbed into stratum-specific baseline hazards instead.
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_extended}
+#| echo: true
+#| message: false
+#| results: hide
+
+lapse1_smoker_strata_extended_stanmodel_name <- "lapse1_smoker_strata_extended_coxph_brms"
+
+lapse1_smoker_strata_extended_coxph_brmsfit <- brm(
+  policy_lifetime | cens(1 - lapsed) + bhaz(gr = smoker_life1, df = 8) ~
+    gender_life1 + cluster_id + prem_sa_ratio,
+  data            = model_training_tbl,
+  family          = cox(link = "log"),
+  backend         = "cmdstanr",
+  chains          = 4,
+  cores           = 4,
+  seed            = stanfit_seed,
+  save_warmup     = FALSE,
+  save_model      = glue("{stan_codedir}/{lapse1_smoker_strata_extended_stanmodel_name}.stan"),
+  file            = glue("{stan_modeldir}/{lapse1_smoker_strata_extended_stanmodel_name}_brmsfit"),
+  output_dir      = stan_modeldir,
+  output_basename = lapse1_smoker_strata_extended_stanmodel_name,
+
+  stan_model_args = list(
+    include_paths = "stan_code",
+    pedantic      = TRUE,
+    dir           = "stan_model"
+    )
+  )
+```
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_extended_summary}
+#| echo: true
+
+summary(lapse1_smoker_strata_extended_coxph_brmsfit)
+```
+
+```{r lapse1_fit_cox_model_brms_smoker_strata_extended_baseline_hazard}
+#| echo: true
+#| fig-width: 12
+#| fig-height: 5
+
+lapse1_smoker_strata_extended_hazard_plot <- plot_baseline_hazard(
+  lapse1_smoker_strata_extended_coxph_brmsfit,
+  show_draws = 0
+  )
+
+lapse1_smoker_strata_extended_hazard_plot
+```
 
 
 
@@ -946,12 +1096,442 @@ gc(verbose = TRUE)
 ```
 
 
+## Smoker-Stratified brms Model Predictions
+
+We now run the same cashflow projection pipeline using the
+`lapse1_smoker_strata_coxph_brmsfit` model. The
+`predict_policy_survivals_brms()` helper computes individual survival
+curves directly at the cashflow week counts by combining the
+stratum-specific cumulative baseline hazard (interpolated from training
+time points) with the linear predictor from the posterior draws.
+
+
+```{r lapse1_smoker_strata_compute_post_survival}
+#| echo: true
+#| message: false
+
+lapse1_smoker_strata_post_survival_file <- glue("{predictions_dir}/lapse1_smoker_strata_post_survival_tbl.parquet")
+
+if (file_exists(lapse1_smoker_strata_post_survival_file)) {
+  message(glue("Loading cached posterior survival from {lapse1_smoker_strata_post_survival_file}"))
+  lapse1_smoker_strata_post_survival_tbl <- read_parquet(lapse1_smoker_strata_post_survival_file)
+} else {
+  message("Computing posterior survival predictions from brms smoker-stratified model")
+
+  lapse1_smoker_strata_post_survival_tbl <- predict_policy_survivals_brms(
+    brmsfit_obj   = lapse1_smoker_strata_coxph_brmsfit,
+    newdata       = inforce_tbl,
+    times         = cashflow_week_count,
+    bhaz_var      = "smoker_life1",
+    ndraws        = 2000,
+    policy_id_col = "policy_id"
+    ) |>
+    group_nest(policy_id, draw_id)
+
+  lapse1_smoker_strata_post_survival_tbl |>
+    write_parquet_compressed(lapse1_smoker_strata_post_survival_file)
+  message(glue("Posterior survival saved to {lapse1_smoker_strata_post_survival_file}"))
+}
+
+lapse1_smoker_strata_post_survival_tbl |> glimpse()
+```
+
+
+```{r lapse1_smoker_strata_sim_lapse_times}
+#| echo: true
+#| message: false
+
+lapse1_smoker_strata_sim_lapse_times_file <- glue("{predictions_dir}/lapse1_smoker_strata_sim_lapse_times_tbl.parquet")
+
+if (file_exists(lapse1_smoker_strata_sim_lapse_times_file)) {
+  message(glue("Loading cached lapse times from {lapse1_smoker_strata_sim_lapse_times_file}"))
+  lapse1_smoker_strata_sim_lapse_times_tbl <- read_parquet(lapse1_smoker_strata_sim_lapse_times_file)
+} else {
+  message("Simulating lapse times from brms smoker-stratified model")
+
+  lapse1_smoker_strata_sim_lapse_times_tbl <- lapse1_smoker_strata_post_survival_tbl |>
+    mutate(
+      rnd_draw   = runif(n(), 0, 1),
+      lapse_time = map2_dbl(
+        data, rnd_draw,
+        \(x, y) extract_survival_time(x, y, min_time = 1),
+
+        .progress = "extract_survival_time"
+        )
+      ) |>
+    select(policy_id, draw_id, lapse_time)
+
+  lapse1_smoker_strata_sim_lapse_times_tbl |>
+    write_parquet_compressed(lapse1_smoker_strata_sim_lapse_times_file)
+  message(glue("Lapse times saved to {lapse1_smoker_strata_sim_lapse_times_file}"))
+}
+
+lapse1_smoker_strata_sim_lapse_times_tbl |> glimpse()
+```
+
+
+```{r lapse1_smoker_strata_construct_policy_sim_data}
+#| echo: true
+
+lapse1_smoker_strata_sim_policy_data_tbl <- lapse1_smoker_strata_sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01"))     ~ "lapsed",
+      as.Date("2016-01-01") <= policy_enddate                                   ~ "inforce",
+      TRUE                                                                       ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+lapse1_smoker_strata_sim_policy_data_tbl |> glimpse()
+```
+
+
+```{r lapse1_smoker_strata_construct_simulated_cashflows}
+#| echo: true
+#| message: false
+
+lapse1_smoker_strata_sim_cashflow_file <- glue("{predictions_dir}/lapse1_smoker_strata_sim_cashflow_tbl.parquet")
+
+if (file_exists(lapse1_smoker_strata_sim_cashflow_file)) {
+  message(glue("Loading cached cashflows from {lapse1_smoker_strata_sim_cashflow_file}"))
+  lapse1_smoker_strata_sim_cashflow_tbl <- read_parquet(lapse1_smoker_strata_sim_cashflow_file)
+} else {
+  message("Computing cashflows from brms smoker-stratified model")
+
+  lapse1_smoker_strata_sim_cashflow_tbl <- lapse1_smoker_strata_sim_policy_data_tbl |>
+    group_nest(draw_id) |>
+    mutate(
+      newdata = map(
+        data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+
+        .progress = "joining_data")
+        ) |>
+    select(-data) |>
+    unnest(newdata) |>
+    left_join(policy_cutdown_tbl |> select(policy_id, prem_ape), by = "policy_id")
+
+  lapse1_smoker_strata_sim_cashflow_tbl |>
+    write_parquet_compressed(lapse1_smoker_strata_sim_cashflow_file)
+  message(glue("Cashflows saved to {lapse1_smoker_strata_sim_cashflow_file}"))
+}
+
+lapse1_smoker_strata_sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r lapse1_smoker_strata_construct_simulated_monthly_cashflows}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_cashflow_tbl <- lapse1_smoker_strata_sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+lapse1_smoker_strata_sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r lapse1_smoker_strata_construct_comparison_plot}
+#| echo: true
+
+ggplot(lapse1_smoker_strata_sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x     = "Time",
+    y     = "Cashflow",
+    title = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse1)"
+    )
+```
+
+
+```{r lapse1_smoker_strata_construct_comparison_plot_ribbons}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_bands_tbl <- lapse1_smoker_strata_sim_monthly_cashflow_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse1_smoker_strata_sim_monthly_bands_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse1)",
+    subtitle = "Showing 50% and 80% bands"
+    )
+```
+
+
+### Recent Policies Only (2010+)
+
+```{r lapse1_smoker_strata_filter_recent_policies}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_cashflow_recent_tbl <- lapse1_smoker_strata_sim_cashflow_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r lapse1_smoker_strata_construct_comparison_plot_recent}
+#| echo: true
+
+ggplot(lapse1_smoker_strata_sim_monthly_cashflow_recent_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse1)",
+    subtitle = "Recent policies (start date >= 2010-01-01)"
+    )
+```
+
+```{r lapse1_smoker_strata_construct_comparison_plot_ribbons_recent}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_bands_recent_tbl <- lapse1_smoker_strata_sim_monthly_cashflow_recent_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse1_smoker_strata_sim_monthly_bands_recent_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse1)",
+    subtitle = "Recent policies (start date >= 2010-01-01), showing 50% and 80% bands"
+    )
+```
+
+
+### Low Premium Policies (prem_ape < 12k)
+
+```{r lapse1_smoker_strata_filter_low_premium_policies}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_cashflow_lowprem_tbl <- lapse1_smoker_strata_sim_cashflow_tbl |>
+  semi_join(lowprem_inforce_policy_ids_tbl, by = "policy_id") |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r lapse1_smoker_strata_construct_comparison_plot_lowprem}
+#| echo: true
+
+ggplot(lapse1_smoker_strata_sim_monthly_cashflow_lowprem_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_lowprem_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows (Low Premium): brms Smoker-Stratified Model (lapse1)",
+    subtitle = "Policies with prem_ape < 12k"
+    )
+```
+
+```{r lapse1_smoker_strata_construct_comparison_plot_ribbons_lowprem}
+#| echo: true
+
+lapse1_smoker_strata_sim_monthly_bands_lowprem_tbl <- lapse1_smoker_strata_sim_monthly_cashflow_lowprem_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse1_smoker_strata_sim_monthly_bands_lowprem_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_lowprem_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows (Low Premium): brms Smoker-Stratified Model (lapse1)",
+    subtitle = "Policies with prem_ape < 12k, showing 50% and 80% bands"
+    )
+```
+
+
+```{r lapse1_smoker_strata_clear_large_objects}
+#| echo: false
+
+lapse1_smoker_strata_sim_cashflow_tbl |>
+  write_parquet(glue("{predictions_dir}/lapse1_smoker_strata_sim_cashflow_tbl.parquet"))
+
+rm(lapse1_smoker_strata_post_survival_tbl, lapse1_smoker_strata_sim_cashflow_tbl)
+
+gc(verbose = TRUE)
+```
+
+
 
 
 # Build Expanded Cox Model
 
 We now want to add a number of covariates to the model to see if we can improve
 it.
+
+## brms Model with Smoker-Stratified Baseline
+
+This is the main Bayesian Cox specification with smoker status moved out of the
+linear predictor and into the baseline hazard strata. All remaining covariates
+continue to be estimated as standard proportional-hazards coefficients.
+
+```{r lapse2_fit_cox_model_brms_smoker_strata}
+#| echo: true
+#| results: hide
+#| message: false
+
+lapse2_smoker_strata_stanmodel_name <- "lapse2_smoker_strata_coxph_brms"
+
+lapse2_smoker_strata_coxph_brmsfit <- brm(
+  policy_lifetime | cens(1 - lapsed) + bhaz(gr = smoker_life1, df = 8) ~
+    gender_life1 + cluster_id + prem_sa_ratio,
+  data            = model_training_tbl,
+  family          = cox(link = "log"),
+  backend         = "cmdstanr",
+  chains          = 4,
+  cores           = 4,
+  seed            = stanfit_seed,
+  save_warmup     = FALSE,
+  save_model      = glue("{stan_codedir}/{lapse2_smoker_strata_stanmodel_name}.stan"),
+  file            = glue("{stan_modeldir}/{lapse2_smoker_strata_stanmodel_name}_brmsfit"),
+  output_dir      = stan_modeldir,
+  output_basename = lapse2_smoker_strata_stanmodel_name,
+
+  stan_model_args = list(
+    include_paths = "stan_code",
+    pedantic      = TRUE,
+    dir           = "stan_model"
+    )
+  )
+```
+
+```{r lapse2_fit_cox_model_brms_smoker_strata_summary}
+#| echo: true
+
+summary(lapse2_smoker_strata_coxph_brmsfit)
+```
+
+```{r lapse2_fit_cox_model_brms_smoker_strata_baseline_hazard}
+#| echo: true
+#| fig-width: 12
+#| fig-height: 5
+
+lapse2_smoker_strata_hazard_plot <- plot_baseline_hazard(
+  lapse2_smoker_strata_coxph_brmsfit,
+  show_draws = 0
+  )
+
+lapse2_smoker_strata_hazard_plot
+```
 
 ## rstanarm Model
 
@@ -1522,6 +2102,379 @@ lapse2_sim_cashflow_tbl  |>
 
 # Remove large objects
 rm(lapse2_post_survival_tbl, lapse2_post_draws_lst, lapse2_sim_cashflow_tbl)
+
+gc(verbose = TRUE)
+```
+
+
+## Smoker-Stratified brms Model Predictions
+
+We repeat the cashflow projection using `lapse2_smoker_strata_coxph_brmsfit`,
+the expanded brms Cox model with `gender_life1`, `cluster_id`, and
+`prem_sa_ratio` as proportional-hazards covariates alongside separate
+smoker-status baseline hazards.
+
+
+```{r lapse2_smoker_strata_compute_post_survival}
+#| echo: true
+#| message: false
+
+lapse2_smoker_strata_post_survival_file <- glue("{predictions_dir}/lapse2_smoker_strata_post_survival_tbl.parquet")
+
+if (file_exists(lapse2_smoker_strata_post_survival_file)) {
+  message(glue("Loading cached posterior survival from {lapse2_smoker_strata_post_survival_file}"))
+  lapse2_smoker_strata_post_survival_tbl <- read_parquet(lapse2_smoker_strata_post_survival_file)
+} else {
+  message("Computing posterior survival predictions from brms expanded smoker-stratified model")
+
+  lapse2_smoker_strata_post_survival_tbl <- predict_policy_survivals_brms(
+    brmsfit_obj   = lapse2_smoker_strata_coxph_brmsfit,
+    newdata       = inforce_tbl,
+    times         = cashflow_week_count,
+    bhaz_var      = "smoker_life1",
+    ndraws        = 2000,
+    policy_id_col = "policy_id"
+    ) |>
+    group_nest(policy_id, draw_id)
+
+  lapse2_smoker_strata_post_survival_tbl |>
+    write_parquet_compressed(lapse2_smoker_strata_post_survival_file)
+  message(glue("Posterior survival saved to {lapse2_smoker_strata_post_survival_file}"))
+}
+
+lapse2_smoker_strata_post_survival_tbl |> glimpse()
+```
+
+
+```{r lapse2_smoker_strata_sim_lapse_times}
+#| echo: true
+#| message: false
+
+lapse2_smoker_strata_sim_lapse_times_file <- glue("{predictions_dir}/lapse2_smoker_strata_sim_lapse_times_tbl.parquet")
+
+if (file_exists(lapse2_smoker_strata_sim_lapse_times_file)) {
+  message(glue("Loading cached lapse times from {lapse2_smoker_strata_sim_lapse_times_file}"))
+  lapse2_smoker_strata_sim_lapse_times_tbl <- read_parquet(lapse2_smoker_strata_sim_lapse_times_file)
+} else {
+  message("Simulating lapse times from brms expanded smoker-stratified model")
+
+  lapse2_smoker_strata_sim_lapse_times_tbl <- lapse2_smoker_strata_post_survival_tbl |>
+    mutate(
+      rnd_draw   = runif(n(), 0, 1),
+      lapse_time = map2_dbl(
+        data, rnd_draw,
+        \(x, y) extract_survival_time(x, y, min_time = 1),
+
+        .progress = "extract_survival_time"
+        )
+      ) |>
+    select(policy_id, draw_id, lapse_time)
+
+  lapse2_smoker_strata_sim_lapse_times_tbl |>
+    write_parquet_compressed(lapse2_smoker_strata_sim_lapse_times_file)
+  message(glue("Lapse times saved to {lapse2_smoker_strata_sim_lapse_times_file}"))
+}
+
+lapse2_smoker_strata_sim_lapse_times_tbl |> glimpse()
+```
+
+
+```{r lapse2_smoker_strata_construct_policy_sim_data}
+#| echo: true
+
+lapse2_smoker_strata_sim_policy_data_tbl <- lapse2_smoker_strata_sim_lapse_times_tbl |>
+  inner_join(policy_cutdown_tbl, by = "policy_id") |>
+  mutate(
+    lapse_date    = as.Date("2015-01-01") + weeks(lapse_time),
+    policy_status = case_when(
+      (policy_enddate <= lapse_date) & (as.Date("2016-01-01") > policy_enddate) ~ "completed",
+      (lapse_date < policy_enddate) & (lapse_date <= as.Date("2016-01-01"))     ~ "lapsed",
+      as.Date("2016-01-01") <= policy_enddate                                   ~ "inforce",
+      TRUE                                                                       ~ "unknown"
+      ),
+    policy_statuschangedate = case_when(
+      policy_status == "lapsed"    ~ lapse_date,
+      policy_status == "completed" ~ policy_enddate,
+      policy_status == "inforce"   ~ policy_startdate,
+      TRUE                         ~ as.Date(NA)
+      )
+    )
+
+lapse2_smoker_strata_sim_policy_data_tbl |> glimpse()
+```
+
+
+```{r lapse2_smoker_strata_construct_simulated_cashflows}
+#| echo: true
+#| message: false
+
+lapse2_smoker_strata_sim_cashflow_file <- glue("{predictions_dir}/lapse2_smoker_strata_sim_cashflow_tbl.parquet")
+
+if (file_exists(lapse2_smoker_strata_sim_cashflow_file)) {
+  message(glue("Loading cached cashflows from {lapse2_smoker_strata_sim_cashflow_file}"))
+  lapse2_smoker_strata_sim_cashflow_tbl <- read_parquet(lapse2_smoker_strata_sim_cashflow_file)
+} else {
+  message("Computing cashflows from brms expanded smoker-stratified model")
+
+  lapse2_smoker_strata_sim_cashflow_tbl <- lapse2_smoker_strata_sim_policy_data_tbl |>
+    group_nest(draw_id) |>
+    mutate(
+      newdata = map(
+        data, \(x) x |> calculate_monthly_cashflows(cashflow_dates = monthly_tbl$date),
+
+        .progress = "joining_data")
+        ) |>
+    select(-data) |>
+    unnest(newdata) |>
+    left_join(policy_cutdown_tbl |> select(policy_id, prem_ape), by = "policy_id")
+
+  lapse2_smoker_strata_sim_cashflow_tbl |>
+    write_parquet_compressed(lapse2_smoker_strata_sim_cashflow_file)
+  message(glue("Cashflows saved to {lapse2_smoker_strata_sim_cashflow_file}"))
+}
+
+lapse2_smoker_strata_sim_cashflow_tbl |> glimpse()
+```
+
+
+```{r lapse2_smoker_strata_construct_simulated_monthly_cashflows}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_cashflow_tbl <- lapse2_smoker_strata_sim_cashflow_tbl |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+
+lapse2_smoker_strata_sim_monthly_cashflow_tbl |> glimpse()
+```
+
+
+```{r lapse2_smoker_strata_construct_comparison_plot}
+#| echo: true
+
+ggplot(lapse2_smoker_strata_sim_monthly_cashflow_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x     = "Time",
+    y     = "Cashflow",
+    title = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse2)"
+    )
+```
+
+
+```{r lapse2_smoker_strata_construct_comparison_plot_ribbons}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_bands_tbl <- lapse2_smoker_strata_sim_monthly_cashflow_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse2_smoker_strata_sim_monthly_bands_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse2)",
+    subtitle = "Showing 50% and 80% bands"
+    )
+```
+
+
+### Recent Policies Only (2010+)
+
+```{r lapse2_smoker_strata_filter_recent_policies}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_cashflow_recent_tbl <- lapse2_smoker_strata_sim_cashflow_tbl |>
+  filter(policy_startdate >= as.Date("2010-01-01")) |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r lapse2_smoker_strata_construct_comparison_plot_recent}
+#| echo: true
+
+ggplot(lapse2_smoker_strata_sim_monthly_cashflow_recent_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse2)",
+    subtitle = "Recent policies (start date >= 2010-01-01)"
+    )
+```
+
+```{r lapse2_smoker_strata_construct_comparison_plot_ribbons_recent}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_bands_recent_tbl <- lapse2_smoker_strata_sim_monthly_cashflow_recent_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse2_smoker_strata_sim_monthly_bands_recent_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_recent_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows: brms Smoker-Stratified Model (lapse2)",
+    subtitle = "Recent policies (start date >= 2010-01-01), showing 50% and 80% bands"
+    )
+```
+
+
+### Low Premium Policies (prem_ape < 12k)
+
+```{r lapse2_smoker_strata_filter_low_premium_policies}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_cashflow_lowprem_tbl <- lapse2_smoker_strata_sim_cashflow_tbl |>
+  semi_join(lowprem_inforce_policy_ids_tbl, by = "policy_id") |>
+  summarise(
+    total_cashflow = sum(cashflow),
+
+    .by = c(draw_id, cashflow_date)
+    ) |>
+  filter(
+    cashflow_date <= as.Date("2016-01-01")
+    )
+```
+
+```{r lapse2_smoker_strata_construct_comparison_plot_lowprem}
+#| echo: true
+
+ggplot(lapse2_smoker_strata_sim_monthly_cashflow_lowprem_tbl) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow, group = draw_id),
+    alpha = 0.01
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_lowprem_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows (Low Premium): brms Smoker-Stratified Model (lapse2)",
+    subtitle = "Policies with prem_ape < 12k"
+    )
+```
+
+```{r lapse2_smoker_strata_construct_comparison_plot_ribbons_lowprem}
+#| echo: true
+
+lapse2_smoker_strata_sim_monthly_bands_lowprem_tbl <- lapse2_smoker_strata_sim_monthly_cashflow_lowprem_tbl |>
+  summarise(
+    p10 = quantile(total_cashflow, 0.10),
+    p25 = quantile(total_cashflow, 0.25),
+    p50 = quantile(total_cashflow, 0.50),
+    p75 = quantile(total_cashflow, 0.75),
+    p90 = quantile(total_cashflow, 0.90),
+
+    .by = c(cashflow_date)
+    )
+
+ggplot(lapse2_smoker_strata_sim_monthly_bands_lowprem_tbl) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p10, ymax = p90),
+    alpha = 0.5
+    ) +
+  geom_ribbon(
+    aes(x = cashflow_date, ymin = p25, ymax = p75),
+    alpha = 0.5
+    ) +
+  geom_line(
+    aes(x = cashflow_date, y = total_cashflow),
+    data   = actual_monthly_lowprem_tbl,
+    colour = "red"
+    ) +
+  scale_y_continuous(labels = label_comma()) +
+  labs(
+    x        = "Time",
+    y        = "Cashflow",
+    title    = "Simulated vs Actual Cashflows (Low Premium): brms Smoker-Stratified Model (lapse2)",
+    subtitle = "Policies with prem_ape < 12k, showing 50% and 80% bands"
+    )
+```
+
+
+```{r lapse2_smoker_strata_clear_large_objects}
+#| echo: false
+
+lapse2_smoker_strata_sim_cashflow_tbl |>
+  write_parquet(glue("{predictions_dir}/lapse2_smoker_strata_sim_cashflow_tbl.parquet"))
+
+rm(lapse2_smoker_strata_post_survival_tbl, lapse2_smoker_strata_sim_cashflow_tbl)
 
 gc(verbose = TRUE)
 ```
